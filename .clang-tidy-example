@@ -1,0 +1,74 @@
+# this is a .clang-tidy example configuration file.
+# For more information, see https://clang.llvm.org/extra/clang-tidy/
+
+# you can customize the checks and options as needed.
+# to use this file, place it in the root directory of your project. and rename it to .clang-tidy. (remove the -example suffix) and remove everything outside the "---" (including the ---)
+---
+Checks: >-
+  modernize-*,
+  performance-*,
+  readability-identifier-naming,
+  clang-analyzer-*,
+  bugprone-*,
+  misc-*,
+
+  -modernize-use-trailing-return-type,
+  -modernize-use-auto,
+  -modernize-return-braced-init-list,
+  -modernize-use-designated-initializers,
+
+  -bugprone-easily-swappable-parameters,
+
+  -performance-enum-size
+#  -misc-non-private-member-variables-in-classes,
+#  -modernize-avoid-c-arrays,
+
+WarningsAsErrors: ''
+
+HeaderFilterRegex: '.*'
+
+CheckOptions:
+  - key:    readability-identifier-naming.VariableCase
+    value:  lower_case
+  - key:    readability-identifier-naming.VariablePrefix
+    value:  ''
+  - key:    readability-identifier-naming.FunctionCase
+    value:  CamelCase
+  - key:    readability-identifier-naming.FunctionPrefix
+    value:  ''
+  - key:    readability-identifier-naming.ParameterCase
+    value:  lower_case
+  - key:    readability-identifier-naming.ParameterPrefix
+    value:  ''
+  - key:    readability-identifier-naming.MemberCase
+    value:  lower_case
+  - key:    readability-identifier-naming.MemberPrefix
+    value:  ''
+  - key:    readability-identifier-naming.MemberSuffix
+    value:  '_'
+  - key:    readability-identifier-naming.PrivateMemberSuffix
+    value:  '_'
+  - key:    readability-identifier-naming.ProtectedMemberSuffix
+    value:  '_'
+  - key:    readability-identifier-naming.PublicMemberSuffix
+    value:  ''
+  - key:    readability-identifier-naming.ClassCase
+    value:  CamelCase
+  - key:    readability-identifier-naming.StructCase
+    value:  CamelCase
+  - key:    readability-identifier-naming.EnumCase
+    value:  CamelCase
+  - key:    readability-identifier-naming.EnumConstantCase # default case
+    value:  aNy_CasE
+  - key:    readability-identifier-naming.ConstantCase
+    value:  aNy_CasE
+  - key:    readability-identifier-naming.TypedefCase
+    value:  CamelCase
+  - key:    readability-identifier-naming.TemplateParameterCase
+    value:  CamelCase
+  - key:    readability-identifier-naming.NamespaceCase
+    value:  CamelCase
+  - key:    readability-identifier-naming.MacroDefinitionCase
+    value:  aNy_CasE
+
+---

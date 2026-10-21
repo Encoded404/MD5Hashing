@@ -1,0 +1,224 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "displayName": "Base Configuration",
+      "description": "Base configuration with common settings",
+      "generator": "Ninja Multi-Config",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "default",
+      "inherits": "base",
+      "displayName": "Default (C++23 std modules + vcpkg)",
+      "description": "Default cross-platform build using C++23 standard-library modules, vcpkg and Ninja Multi-Config. Uses the default system stdlib (libstdc++).",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": {
+          "type": "FILEPATH",
+          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        }
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{VCPKG_ROOT}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "libcxx",
+      "inherits": "base",
+      "displayName": "Clang + libc++ std modules",
+      "description": "Clang with libc++ and C++23 std modules. Recommended for `import std;`, because Clang + libstdc++ can crash on <memory> in module contexts. Whole vcpkg graph is rebuilt against libc++ via the x64-linux-libcxx overlay triplet.",
+      "binaryDir": "${sourceDir}/build-libcxx",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": {
+          "type": "FILEPATH",
+          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        },
+        "CMAKE_CXX_COMPILER": "clang++",
+        "USE_CXX_MODULES": "ON",
+        "USE_LIBCPP": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-linux-libcxx",
+        "CMAKE_CXX_COMPILER_LAUNCHER": ""
+      },
+      "environment": {
+        "CCACHE_DISABLE": "1"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{VCPKG_ROOT}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "modules-off",
+      "inherits": "base",
+      "displayName": "C++20 classic headers (no std module)",
+      "description": "C++20 + classic #include headers, modules for user code only (import lib_example;). Useful when the toolchain cannot build the std module.",
+      "binaryDir": "${sourceDir}/build-modules-off",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": {
+          "type": "FILEPATH",
+          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        },
+        "USE_CXX_MODULES": "OFF"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{VCPKG_ROOT}",
+        "rhs": ""
+      }
+    },
+    {
+      "name": "windows",
+      "inherits": "base",
+      "displayName": "Windows x86_64 (llvm-mingw + libc++ + vcpkg)",
+      "description": "Cross-compile for Windows x86_64 from Linux using the llvm-mingw toolchain (Clang + libc++ with the std module). Requires the llvm-mingw release extracted under toolchains/ (or LLVM_MINGW_ROOT) and CMake >= 4.2 for `import std;`. See docs/cross-compiling-windows.md.",
+      "binaryDir": "${sourceDir}/build-windows",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": {
+          "type": "FILEPATH",
+          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        },
+        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": {
+          "type": "FILEPATH",
+          "value": "${sourceDir}/cmake/toolchains/llvm-mingw.cmake"
+        },
+        "VCPKG_TARGET_TRIPLET": "x64-mingw-libcxx",
+        "USE_LIBCPP": "ON",
+        "ENABLE_SANITIZERS": "OFF",
+        "CLANG_TIDY_ENABLED": "OFF",
+        "BUILD_TESTING": "OFF",
+        "CMAKE_CXX_COMPILER_LAUNCHER": ""
+      },
+      "environment": {
+        "CCACHE_DISABLE": "1"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{VCPKG_ROOT}",
+        "rhs": ""
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "displayName": "Build Debug",
+      "configurePreset": "default",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "displayName": "Build Release",
+      "configurePreset": "default",
+      "configuration": "Release"
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "Build RelWithDebInfo",
+      "configurePreset": "default",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "libcxx-debug",
+      "displayName": "Build Debug (libc++)",
+      "configurePreset": "libcxx",
+      "configuration": "Debug",
+      "environment": {
+        "CCACHE_DISABLE": "1"
+      }
+    },
+    {
+      "name": "libcxx-release",
+      "displayName": "Build Release (libc++)",
+      "configurePreset": "libcxx",
+      "configuration": "Release",
+      "environment": {
+        "CCACHE_DISABLE": "1"
+      }
+    },
+    {
+      "name": "modules-off-debug",
+      "displayName": "Build Debug (no std module)",
+      "configurePreset": "modules-off",
+      "configuration": "Debug"
+    },
+    {
+      "name": "modules-off-release",
+      "displayName": "Build Release (no std module)",
+      "configurePreset": "modules-off",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-debug",
+      "displayName": "Build Windows x86_64 Debug",
+      "configurePreset": "windows",
+      "configuration": "Debug",
+      "environment": {
+        "CCACHE_DISABLE": "1"
+      }
+    },
+    {
+      "name": "windows-release",
+      "displayName": "Build Windows x86_64 Release",
+      "configurePreset": "windows",
+      "configuration": "Release",
+      "environment": {
+        "CCACHE_DISABLE": "1"
+      }
+    },
+    {
+      "name": "windows-relwithdebinfo",
+      "displayName": "Build Windows x86_64 RelWithDebInfo",
+      "configurePreset": "windows",
+      "configuration": "RelWithDebInfo",
+      "environment": {
+        "CCACHE_DISABLE": "1"
+      }
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "default",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "default",
+      "configuration": "Release"
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "default",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "libcxx-debug",
+      "configurePreset": "libcxx",
+      "configuration": "Debug"
+    },
+    {
+      "name": "libcxx-release",
+      "configurePreset": "libcxx",
+      "configuration": "Release"
+    },
+    {
+      "name": "modules-off-debug",
+      "configurePreset": "modules-off",
+      "configuration": "Debug"
+    },
+    {
+      "name": "modules-off-release",
+      "configurePreset": "modules-off",
+      "configuration": "Release"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+    "name": "simple-modern-cmake-template",
+    "description": "A simple modern CMake template project",
+    "homepage": "https://github.com/Encoded404/CMakeTemplate",
+    "version": "1.0.0",
+    "license": "MIT",
+    "dependencies": [
+        {
+            "name": "gtest",
+            "version>=": "1.13.0"
+        },
+        "cli11"
+    ]
+}
