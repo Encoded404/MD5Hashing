@@ -177,7 +177,7 @@ if(NOT _TEMPLATE_LLVM_MINGW_TOOLCHAIN)
     set(CMAKE_OBJDUMP "${_tpl_mingw_bin}/llvm-objdump" CACHE FILEPATH "" FORCE)
     set(CMAKE_NM      "${_tpl_mingw_bin}/llvm-nm"      CACHE FILEPATH "" FORCE)
 
-    # Module dependency scanner (used for C++20/23 named modules and import std).
+    # Module dependency scanner (used for C++26 named modules and import std).
     set(CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS
         "${_tpl_mingw_bin}/${_tpl_mingw_prefix}-clang-scan-deps"
         CACHE FILEPATH "" FORCE)

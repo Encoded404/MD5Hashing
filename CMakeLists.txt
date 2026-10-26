@@ -1,36 +1,43 @@
 cmake_minimum_required(VERSION 3.30)
 
 # Enable CMake's std-module support (`import std;`).
-# import std; is still experimental in CMake, so older versions require a
-# feature guid. CMake >= 4.3 no longer needs one.
+#
+# `import std;` is still gated behind a per-release activation value on CMake
+# 3.30-4.4. CMake deliberately changes that value between releases, so each
+# verified band is listed explicitly. CMake >= 4.5 no longer needs the gate.
+# This must run before project(), because the CXX toolchain probe records
+# whether std-module support is available.
 if( NOT CMAKE_EXPERIMENTAL_CXX_IMPORT_STD )
-	if( ${CMAKE_VERSION} VERSION_GREATER_EQUAL 4.3 )
-		set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD 451f2fe2-a8a2-47c3-bc32-94786d8fc91b)
-	elseif( ${CMAKE_VERSION} VERSION_GREATER_EQUAL 3.30 )
+	if( CMAKE_VERSION VERSION_GREATER_EQUAL 4.5 )
+		# CMake >= 4.5 enables import std without the experimental feature gate.
+	elseif( CMAKE_VERSION VERSION_GREATER_EQUAL 4.4 )
+		set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "f35a9ac6-8463-4d38-8eec-5d6008153e7d")
+	elseif( CMAKE_VERSION VERSION_GREATER_EQUAL 4.3 )
+		set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "451f2fe2-a8a2-47c3-bc32-94786d8fc91b")
+	elseif( CMAKE_VERSION VERSION_GREATER_EQUAL 3.30 AND CMAKE_VERSION VERSION_LESS 4.3 )
+		# 3.30 through 4.2 use the same activation value (verified against
+		# CMake 3.31.11 and the CMake 4.2 experimental-features guide).
 		set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "d0edc3af-4c50-42ea-a356-e2862fe7a444")
-	endif ()
-endif ()
+	else()
+		message(FATAL_ERROR
+			"CMake ${CMAKE_VERSION} is outside the verified range for `import std;`. "
+			"Use CMake 3.30-4.2, 4.3, 4.4, or >= 4.5. Alternatively set "
+			"CMAKE_EXPERIMENTAL_CXX_IMPORT_STD to the value documented for "
+			"CxxImportStd in this CMake's Help/dev/experimental.rst.")
+	endif()
+endif()
 
-set(PROJECT_NAME "ModernCMakeAppTemplate")
-set(LIBRARY_TARGET "ModernCMakeAppInternalLib")
-set(APP_TARGET "ModernCMakeApp")
+set(PROJECT_NAME "HashApp")
+set(HASH_LIBRARY_TARGET "HashLib")
+set(APP_TARGET "HashApp")
 
 # if this is not set by the user cmake will decide
 set(OUTPUT_PATH "${CMAKE_BINARY_DIR}/bin")
 
-# `USE_CXX_MODULES`: toggle for C++23 standard-library modules (`import std;`).
-#   ON  -> C++23 + CMAKE_CXX_MODULE_STD, and the example code uses `import std;`.
-#         Requires a Clang or GCC compiler (MSVC has no C++23 std module).
-#   OFF -> C++20 + classic `#include <...>` headers. Useful when the toolchain
-#         or stdlib cannot reliably build the std module (e.g. Clang +
-#         libstdc++, which currently crashes on <memory> in module contexts).
-option(USE_CXX_MODULES "Use C++23 standard-library modules (import std;)" ON)
-
 # `USE_LIBCPP`: build against libc++ instead of libstdc++ (Clang only).
-#   `import std;` with Clang + libstdc++ currently rides on GCC's bits/std.cc
-#   and hits real compiler crashes (e.g. <memory>), so the std module is
-#   practically always paired with libc++, which ships a proper module map
-#   (libc++.modules.json).
+#   libc++ ships a proper module map (libc++.modules.json) and is the
+#   recommended standard library for `import std;`. There is no header fallback:
+#   if this is ON and libc++ is unavailable, configuration fails.
 #   NOTE: when ON, the vcpkg dependency tree must also be built against libc++,
 #   otherwise ABI mismatches occur. That's what the `libcxx` preset does via the
 #   overlay triplet cmake/triplets/x64-linux-libcxx.cmake.
@@ -40,9 +47,9 @@ set(CMAKE_CXX_EXTENSIONS OFF CACHE BOOL "Use standard C++" FORCE)
 
 # ---- IMPORTANT: stdlib flags must be set BEFORE project() ----
 #
-# CMake's built-in std-module detection (the __cmake_cxx23 target) runs during
-# project(), where it discovers the compiler frontend variant and the
-# <source>/<bits>/std.cc file to use for `import std;`.
+# CMake's built-in std-module detection runs during project(), where it
+# discovers the compiler frontend variant and the standard-library module
+# source to use for `import std;`.
 #
 # On Fedora with Clang, the /etc/clang/x86_64-redhat-linux-gnu-clang++.cfg
 # file passes `--gcc-triple=x86_64-redhat-linux`. This makes the compiler
@@ -54,18 +61,13 @@ if(USE_LIBCPP)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
 endif()
 
-# The C++ standard drives everything else in this template: C++23 enables
-# `import std;`, C++20 keeps the classic header-based path.
-if(USE_CXX_MODULES)
-	set(CMAKE_CXX_STANDARD 23)
-	set(CMAKE_CXX_STANDARD_REQUIRED ON)
-	# Set before project() so CMake's std-module detection is active while the
-	# compiler (and its std module files) are being probed.
-	set(CMAKE_CXX_MODULE_STD ON)
-else()
-	set(CMAKE_CXX_STANDARD 20)
-	set(CMAKE_CXX_STANDARD_REQUIRED ON)
-endif()
+# C++26 is mandatory: every first-party translation unit uses `import std;`,
+# and there is no classic header-based fallback.
+set(CMAKE_CXX_STANDARD 26)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Set before project() so CMake's std-module detection is active while the
+# compiler (and its std module files) are being probed.
+set(CMAKE_CXX_MODULE_STD ON)
 
 # ── Strip ccache shim directories from PATH before compiler detection ──
 # Distros like Fedora put the ccache wrapper directory (e.g. /usr/lib64/ccache)
@@ -105,27 +107,23 @@ project(${PROJECT_NAME} VERSION 1.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(USE_CXX_MODULES)
-	# CMAKE_CXX_MODULE_STD ON tells CMake to build the <std> module (the
-	# auto-created __cmake_cxx23 target) and propagate the reference down to
-	# every consumer target through its modmap file
-	# (-fmodule-file=std=.../std.pcm). Without the ON flag the consumers fail
-	# with "module 'std' not found".
-	set(CMAKE_CXX_MODULE_STD ON)
+# CMAKE_CXX_MODULE_STD ON was set before project(). It tells CMake to build
+# the std module and propagate its BMI reference to every consumer target
+# through the target's modmap file (-fmodule-file=std=...). Without it,
+# consumers fail with "module 'std' not found".
+set(CMAKE_CXX_MODULE_STD ON)
 
-	# ---- Compiler gate ----
-	# The template is not designed around MSVC, and `import std;` does not exist
-	# there. Rather than hard-failing, warn and fall back to the header path so
-	# the project still configures and builds.
-	set(USE_STD_MODULE ${USE_CXX_MODULES})
-	if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-		message(WARNING
-			"USE_CXX_MODULES=ON but the compiler (${CMAKE_CXX_COMPILER_ID}) has no C++23 "
-			"std module support. Falling back to classic #include headers.")
-		set(USE_STD_MODULE OFF)
-	endif()
-else()
-	set(USE_STD_MODULE OFF)
+# ---- C++26 std-module support ----
+# CMAKE_CXX_COMPILER_IMPORT_STD is populated by CMake's toolchain probe on the
+# releases that gate `import std;`. CMake >= 4.5 enables the feature generally
+# and may not populate the variable, so only check it on older CMake.
+if(CMAKE_VERSION VERSION_LESS 4.5
+   AND DEFINED CMAKE_CXX_COMPILER_IMPORT_STD
+   AND NOT "26" IN_LIST CMAKE_CXX_COMPILER_IMPORT_STD)
+	message(FATAL_ERROR
+		"${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} does not advertise "
+		"C++26 std-module support. This project requires `import std;` in C++26. "
+		"Use Clang >= 18.1.2 with libc++ (recommended) or GCC >= 15 with libstdc++.")
 endif()
 
 # ---- libc++ availability (only valid after project() — compiler is known) ----
@@ -145,87 +143,57 @@ if(USE_LIBCPP)
 
 		unset(CMAKE_REQUIRED_FLAGS)
 
-		if (HAS_LIBCXX)
+		if(HAS_LIBCXX)
 			message(STATUS "libc++ detected and working — using it")
-
-			# Force -stdlib=libc++ onto the auto-generated std-module targets so
-			# the module BMI is compiled against the same libc++ headers that the
-			# rest of the project uses.
-			if(TARGET __cmake_cxx23)
-				set_property(TARGET __cmake_cxx23 APPEND PROPERTY COMPILE_OPTIONS "-stdlib=libc++")
-			endif()
-			if(TARGET __cmake_cxx26)
-				set_property(TARGET __cmake_cxx26 APPEND PROPERTY COMPILE_OPTIONS "-stdlib=libc++")
-			endif()
-
 			# Linker flag is not automatically propagated from CMAKE_CXX_FLAGS.
 			add_link_options(-stdlib=libc++)
 		else()
-			message(WARNING "USE_LIBCPP=ON but libc++ is NOT available — falling back to libstdc++")
-			string(REPLACE "-stdlib=libc++" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-			if(USE_STD_MODULE)
-				# Clang + libstdc++ cannot reliably build the std module (the
-				# <memory>/bits/std.cc issue above) — fall back to headers too.
-				message(WARNING "Disabling std-module support because libc++ is unavailable.")
-				set(USE_STD_MODULE OFF)
-			endif()
+			message(FATAL_ERROR
+				"USE_LIBCPP=ON but libc++ is not available. Install libc++ and its "
+				"module metadata (libc++.modules.json), or configure with "
+				"-DUSE_LIBCPP=OFF to use libstdc++.")
 		endif()
 	else()
-		message(WARNING "USE_LIBCPP=ON but the compiler is not Clang — ignoring")
-		string(REPLACE "-stdlib=libc++" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+		message(FATAL_ERROR
+			"USE_LIBCPP=ON requires Clang; the configured compiler is "
+			"${CMAKE_CXX_COMPILER_ID}. Configure with -DUSE_LIBCPP=OFF or use "
+			"-DCMAKE_CXX_COMPILER=clang++.")
 	endif()
 endif()
 
-# Tell the source files whether the C++23 std module is actually in use.
-# The example code branches between `import std;` and `#include <...>` based on
-# this define (see src/lib1/lib_example.cpp and src/app/main.cpp).
-if(USE_STD_MODULE)
-	add_compile_definitions(USE_STD_MODULE=1)
-endif()
-
-# enable ccache (unsafe with modules — see warning below)
-find_program(CCACHE_PROGRAM ccache)
-
-# ccache is only auto-enabled on the header-only (non-module) path. With C++
-# modules it is not safe (stale module-object hazard), so we never enable it
-# implicitly there — an explicitly requested launcher is still honoured and
-# merely warned about further down.
-if(CCACHE_PROGRAM AND NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER AND NOT USE_STD_MODULE)
-	#set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_PROGRAM}) # we dont use the c compiler rn
-	set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
-endif()
+# ccache is never enabled implicitly: its cache key does not cover C++ module
+# BMI/IFC contents, so it can serve objects compiled against a stale module
+# interface (silent ODR corruption). An explicitly requested launcher is still
+# honoured, but warned about below.
 
 # C++ modules (esp. `import std;`) are NOT safe under ccache: ccache's cache
 # key does not cover C++ module BMI/IFC contents, so it can serve objects
-# compiled against a stale module interface — silent ODR corruption. We keep
-# ccache usable (the header-based path is fine) but warn loudly when modules
-# are enabled together with ccache so it is not a silent foot-gun. This checks
-# both the launcher property AND the resolved compiler path (some distros, e.g.
-# Fedora, put ccache wrapper dirs such as /usr/lib64/ccache early in PATH, so a
-# bare `clang++`/`g++` is already the ccache wrapper).
-if(USE_STD_MODULE)
-	set(_ccache_in_use OFF)
-	if(CCACHE_PROGRAM AND CMAKE_CXX_COMPILER_LAUNCHER MATCHES "ccache")
-		set(_ccache_in_use ON)
-	endif()
-	get_filename_component(_cc_name "${CMAKE_CXX_COMPILER}" NAME)
-	file(REAL_PATH "${CMAKE_CXX_COMPILER}" _cc_real)
-	get_filename_component(_cc_real_name "${_cc_real}" NAME)
-	if(_cc_name MATCHES "ccache" OR _cc_real_name MATCHES "ccache")
-		set(_ccache_in_use ON)
-	endif()
-	if(_ccache_in_use)
-		message(WARNING
-			"The C++ compiler resolves to a ccache wrapper (${CMAKE_CXX_COMPILER}). "
-			"ccache is unsafe with C++ modules (stale module-object hazard). Prefer "
-			"the 'libcxx' preset (which disables it) or point CMake at the real "
-			"compiler, e.g. -DCMAKE_CXX_COMPILER=/usr/bin/clang++.")
-	endif()
-	unset(_ccache_in_use)
-	unset(_cc_name)
-	unset(_cc_real)
-	unset(_cc_real_name)
+# compiled against a stale module interface — silent ODR corruption. Warn
+# loudly if an explicitly requested launcher or the resolved compiler resolves
+# to ccache. This checks both the launcher property AND the compiler path (some
+# distros, e.g. Fedora, put ccache wrapper dirs such as /usr/lib64/ccache early
+# in PATH, so a bare `clang++`/`g++` is already the ccache wrapper).
+set(_ccache_in_use OFF)
+if(CMAKE_CXX_COMPILER_LAUNCHER MATCHES "ccache")
+	set(_ccache_in_use ON)
 endif()
+get_filename_component(_cc_name "${CMAKE_CXX_COMPILER}" NAME)
+file(REAL_PATH "${CMAKE_CXX_COMPILER}" _cc_real)
+get_filename_component(_cc_real_name "${_cc_real}" NAME)
+if(_cc_name MATCHES "ccache" OR _cc_real_name MATCHES "ccache")
+	set(_ccache_in_use ON)
+endif()
+if(_ccache_in_use)
+	message(WARNING
+		"The C++ compiler resolves to a ccache wrapper (${CMAKE_CXX_COMPILER}). "
+		"ccache is unsafe with C++ modules (stale module-object hazard). Prefer "
+		"the 'libcxx' preset (which disables it) or point CMake at the real "
+		"compiler, e.g. -DCMAKE_CXX_COMPILER=/usr/bin/clang++.")
+endif()
+unset(_ccache_in_use)
+unset(_cc_name)
+unset(_cc_real)
+unset(_cc_real_name)
 
 # ── Sanitizers (Debug builds) ──────────────────────────────────────────
 # ASan + UBSan are applied to the library, the app and the tests through the
@@ -345,14 +313,15 @@ else()
 endif()
 
 # Build the logging interface as a C++ module (`import logiface;` /
-# `import logiface.ConsoleLogger;`) when modules are enabled, and as plain
-# headers otherwise. The macro-only `logging_macros.hpp` header is safe to drop
-# into a module's global module fragment next to `import std;` (no std includes,
-# avoids the `<memory>` clash / Clang bug LLVM #138558).
-set(LOGIFACE_BUILD_MODULE ${USE_CXX_MODULES} CACHE BOOL "" FORCE)
-# Keep the logging module itself on `#include` headers instead of `import std;`
-# for the same reason.
-set(LOGIFACE_USE_STD_MODULE OFF CACHE BOOL "" FORCE)
+# `import logiface.ConsoleLogger;`). The macro-only `logging_macros.hpp` header
+# has no `#include` directives, so it is safe before `import std;` in a module
+# unit's global module fragment and in ordinary test translation units.
+set(LOGIFACE_BUILD_MODULE ON CACHE BOOL "" FORCE)
+# The logging module itself also uses `import std;` instead of standard headers.
+set(LOGIFACE_USE_STD_MODULE ON CACHE BOOL "" FORCE)
+# GCC's `.gcm` files are dialect-strict, so the logging module must be built
+# with exactly the consumer's standard.
+set(LOGIFACE_CXX_STANDARD 26 CACHE STRING "" FORCE)
 
 if(EXISTS "${LOGGING_INTERFACE_DIR}/CMakeLists.txt")
 	add_subdirectory("${LOGGING_INTERFACE_DIR}" cppLoggingInterface)

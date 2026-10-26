@@ -1,17 +1,17 @@
-#pragma once
+module;
 
-#include <logging/logging.hpp>
-#include <logging/ConsoleLogger.hpp>
-
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <optional>
-#include <string>
-
+// GTest is a preprocessor-based framework, so its headers must stay in the
+// global module fragment. They are included before the module declaration and
+// before `import std;`; that ordering is also required in normal test TUs.
 #include <gtest/gtest.h>
 
-namespace TestLogging {
+export module test_logging;
+
+import std;
+import logiface;
+import logiface.ConsoleLogger;
+
+export namespace TestLogging {
 
 // GTest listener that routes per-test logs to TEST_LOG_DIR/[suite]_[test].txt.
 class PerTestFileLogger final : public ::testing::EmptyTestEventListener {
@@ -38,9 +38,9 @@ public:
             return;
         }
 
-        logger_ = std::make_unique<::Logiface::ConsoleLogger>(::Logiface::Level::debug, *stream_, *stream_);
+        logger_.emplace(::Logiface::Level::debug, *stream_, *stream_);
         previous_logger_ = ::Logiface::GetLogger();
-        ::Logiface::SetLogger(logger_.get());
+        ::Logiface::SetLogger(&logger_.value());
     }
 
     void OnTestEnd(const ::testing::TestInfo&) override {
@@ -64,7 +64,7 @@ private:
     }
 
     std::unique_ptr<std::ofstream> stream_{};
-    std::unique_ptr<::Logiface::ConsoleLogger> logger_{};
+    std::optional<::Logiface::ConsoleLogger> logger_{};
     ::Logiface::Logger* previous_logger_{};
     bool active_{false};
 };

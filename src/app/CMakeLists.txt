@@ -2,9 +2,22 @@
 add_executable(${APP_TARGET})
 target_sources(${APP_TARGET} PRIVATE
     main.cpp
+    Timer.cpp
 )
 
-target_link_libraries(${APP_TARGET} PRIVATE ${LIBRARY_TARGET})
+target_sources(${APP_TARGET} PRIVATE
+    FILE_SET CXX_MODULES
+    FILES
+        Timer.cppm
+)
+
+target_link_libraries(${APP_TARGET} PRIVATE ${HASH_LIBRARY_TARGET})
+
+# CLI parsing. CLI11 is a vcpkg dependency (see vcpkg.json); the `libcxx` preset
+# builds it against libc++ through the x64-linux-libcxx overlay triplet, so its
+# ABI matches the std module used by this executable.
+find_package(CLI11 CONFIG REQUIRED)
+target_link_libraries(${APP_TARGET} PRIVATE CLI11::CLI11)
 
 # Optionally set executable output name; keep simple default
 set_target_properties(${APP_TARGET} PROPERTIES OUTPUT_NAME ${APP_TARGET})
@@ -15,9 +28,9 @@ endif()
 
 # Set the C++ standard and enable compiler features
 # (C++ standard is set globally in the top-level CMakeLists; this pins a floor)
-target_compile_features(${APP_TARGET} PRIVATE cxx_std_20)
+target_compile_features(${APP_TARGET} PRIVATE cxx_std_26)
 
-# Compiler-specific warning options for the library target
+# Compiler-specific warning options for the executable target
 target_compile_options(${APP_TARGET} PRIVATE
     $<$<CXX_COMPILER_ID:GNU>:-Wall -Wextra -Wpedantic>
     $<$<CXX_COMPILER_ID:Clang>:-Wall -Wextra -Wpedantic>
@@ -44,7 +57,7 @@ target_compile_definitions(${APP_TARGET}
         LOGIFACE_DEFAULT_TO_FUNCTION=1
 )
 
-# Size/optimization glue (see src/lib1/CMakeLists.txt for why it is per-target)
+# Size/optimization glue (see src/HashLib/CMakeLists.txt for why it is per-target)
 target_link_libraries(${APP_TARGET} PRIVATE project_sections project_size)
 if(TARGET project_sanitizers)
     target_link_libraries(${APP_TARGET} PRIVATE project_sanitizers)

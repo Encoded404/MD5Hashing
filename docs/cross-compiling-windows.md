@@ -4,14 +4,16 @@ This template can be cross-compiled from a Linux x86_64 host to Windows x86_64
 using [llvm-mingw](https://github.com/mstorsjo/llvm-mingw): a self-contained
 Clang/LLD toolchain that ships the mingw-w64 sysroot, compiler-rt, libunwind and
 libc++ — **including the libc++ standard-library module metadata**, which is what
-makes `import std;` work on the Windows target.
+makes C++26 `import std;` work on the Windows target.
 
 ## 1. Prerequisites
 
 - Linux x86_64 build host
 - CMake ≥ 4.2 (4.2 introduced `CMAKE_CXX_STDLIB_MODULES_JSON`, which the cross
-  toolchain uses to point CMake at the *target* libc++ module metadata; the
-  CMake bundled with recent CLion releases works)
+  toolchain uses to point CMake at the *target* libc++ module metadata; CMake 4.3+
+  is recommended for C++26, and the CMake bundled with recent CLion releases
+  works)
+- The llvm-mingw libc++ must support `-std=c++26` and the C++26 std module
 - Ninja
 - vcpkg, with `VCPKG_ROOT` set
 - *optional*: `wine`, to run the resulting executables

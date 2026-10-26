@@ -1,5 +1,5 @@
-# app library
-add_subdirectory(lib1)
+# Hash library
+add_subdirectory(HashLib)
 
-# Executable that links the static library
+# CLI that links the static library
 add_subdirectory(app)
