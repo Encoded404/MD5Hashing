@@ -53,16 +53,32 @@ const hashlib::Digest digest =
 `hashlib::Digest` is the raw 16-byte result; format it as hex (or base64) at the
 call site if a printable representation is needed.
 
-`naive_md5` is a deliberately naive, single-shot implementation that follows the
-Wikipedia pseudocode closely: it copies and pads the whole input in memory and
-favours readability over speed. It is intended for learning and benchmarking,
-not as a security primitive (MD5 is cryptographically broken) and not as a
-streaming hash API. Known-answer tests (RFC 1321 plus padding and
-large-input edges) live in `tests/hashlib_tests.cpp`.
+Two implementations are exported. They produce identical digests for every
+input, so the choice is purely about speed versus readability:
+
+| function | allocation | notes |
+|---|---|---|
+| `hashlib::naive_md5` | yes (`std::vector`) | follows the Wikipedia pseudocode closely; intended for learning and benchmarking |
+| `hashlib::md5_fast` | none, `noexcept` | 64-byte blocks hashed in place, 64 steps expanded at compile time, state kept in registers; ~3x the throughput of `naive_md5` as currently written (see `docs/md5-optimization.md` for why the naive one is that slow) |
+
+Both are single-shot, not streaming, and neither is a security primitive (MD5 is
+cryptographically broken). Known-answer tests (RFC 1321 plus padding and
+large-input edges) run against every exported implementation in
+`tests/hashlib_tests.cpp`; the measurements behind `md5_fast` are in
+`docs/md5-optimization.md`.
+
+The CLI runs the implementations side by side, which doubles as a correctness
+check:
+
+```bash
+HashApp "hello"                  # every implementation, all must agree
+HashApp -a fast "hello"          # just one; -a naive,fast or -a fast -a naive for a subset
+HashApp -a all -b --benchmark-count 100000 "hello"
+```
 
 ## Prerequisites
 
-- CMake ≥ 3.30 (3.30-4.2 share one activation value; 4.3 and 4.4 have their own; ≥ 4.5 needs no gate. 4.3+ recommended)
+- CMake ≥ 3.30 (3.30-4.2 share one activation value; newer cmake versions have some issues with modules, so 4.3.6 is the last that works until 4.5.0)
 - Clang ≥ 18.1.2 with libc++ (recommended), or GCC ≥ 15 with libstdc++
 - Ninja ≥ 1.11
 - vcpkg available and `VCPKG_ROOT` set (the presets expect it)

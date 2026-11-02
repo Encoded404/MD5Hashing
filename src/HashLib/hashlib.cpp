@@ -112,4 +112,206 @@ Digest naive_md5(std::span<const std::byte> input) {
     return result;
 }
 
+// md5_fast: the optimised single-message implementation.
+//
+// Same digest as naive_md5. Deliberately no logging and no allocation:
+// the point of this variant is that nothing here can allocate, throw or touch a lock, so a level check or a to_string() would defeat it.
+// The measurements behind each choice (state by value, always_inline fold, std::rotl, ternary F, no prefetch) are in docs/md5-optimization.md.
+
+#if defined(_MSC_VER)
+#define HASHLIB_ALWAYS_INLINE __forceinline
+#define HASHLIB_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define HASHLIB_ALWAYS_INLINE inline __attribute__((always_inline))
+#define HASHLIB_NOINLINE __attribute__((noinline))
+#else
+#define HASHLIB_ALWAYS_INLINE inline
+#define HASHLIB_NOINLINE inline
+#endif
+
+namespace {
+
+    constexpr std::size_t kBlockBytes = 64;
+
+    struct State {
+        std::uint32_t a = 0x67452301U;
+        std::uint32_t b = 0xefcdab89U;
+        std::uint32_t c = 0x98badcfeU;
+        std::uint32_t d = 0x10325476U;
+    };
+
+    // RFC 1321: K[i] = floor(2^32 * |sin(i + 1)|). Spelled out rather than computed
+    // so the table is exactly the published constants.
+    constexpr std::array<std::uint32_t, 64> kRoundConstants {
+        0xd76aa478U, 0xe8c7b756U, 0x242070dbU, 0xc1bdceeeU, 0xf57c0fafU, 0x4787c62aU, 0xa8304613U,
+        0xfd469501U, 0x698098d8U, 0x8b44f7afU, 0xffff5bb1U, 0x895cd7beU, 0x6b901122U, 0xfd987193U,
+        0xa679438eU, 0x49b40821U, 0xf61e2562U, 0xc040b340U, 0x265e5a51U, 0xe9b6c7aaU, 0xd62f105dU,
+        0x02441453U, 0xd8a1e681U, 0xe7d3fbc8U, 0x21e1cde6U, 0xc33707d6U, 0xf4d50d87U, 0x455a14edU,
+        0xa9e3e905U, 0xfcefa3f8U, 0x676f02d9U, 0x8d2a4c8aU, 0xfffa3942U, 0x8771f681U, 0x6d9d6122U,
+        0xfde5380cU, 0xa4beea44U, 0x4bdecfa9U, 0xf6bb4b60U, 0xbebfbc70U, 0x289b7ec6U, 0xeaa127faU,
+        0xd4ef3085U, 0x04881d05U, 0xd9d4d039U, 0xe6db99e5U, 0x1fa27cf8U, 0xc4ac5665U, 0xf4292244U,
+        0x432aff97U, 0xab9423a7U, 0xfc93a039U, 0x655b59c3U, 0x8f0ccc92U, 0xffeff47dU, 0x85845dd1U,
+        0x6fa87e4fU, 0xfe2ce6e0U, 0xa3014314U, 0x4e0811a1U, 0xf7537e82U, 0xbd3af235U, 0x2ad7d2bbU,
+        0xeb86d391U
+    };
+
+    // Left-rotate amount per step: four steps per round, repeated over 16 steps.
+    constexpr std::array<std::uint32_t, 64> kRotations {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9,  14, 20, 5, 9,
+        14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+    };
+
+    // Message-word index per step, derived rather than typed out.
+    constexpr std::array<std::uint32_t, 64> kMessageIndex = [] {
+        std::array<std::uint32_t, 64> index{};
+        for (std::size_t i = 0; i < 64; ++i) {
+            const std::size_t round = i / 16;
+            const std::size_t step = i % 16;
+            if (round == 0) {
+                index[i] = static_cast<std::uint32_t>(step);
+            } else if (round == 1) {
+                index[i] = static_cast<std::uint32_t>((5 * step + 1) % 16);
+            } else if (round == 2) {
+                index[i] = static_cast<std::uint32_t>((3 * step + 5) % 16);
+            } else {
+                index[i] = static_cast<std::uint32_t>((7 * step) % 16);
+            }
+        }
+        return index;
+    }();
+
+    // MD5 is defined little-endian; the memcpy folds into a single unaligned load.
+    [[nodiscard]] std::uint32_t LoadLe32(const std::byte* bytes) noexcept {
+        std::uint32_t value;
+        std::memcpy(&value, bytes, sizeof(value));
+        if constexpr (std::endian::native == std::endian::big) {
+            value = std::byteswap(value);
+        }
+        return value;
+    }
+
+    void StoreLe32(std::byte* bytes, std::uint32_t value) noexcept {
+        if constexpr (std::endian::native == std::endian::big) {
+            value = std::byteswap(value);
+        }
+        std::memcpy(bytes, &value, sizeof(value));
+    }
+
+    void StoreLe64(std::byte* bytes, std::uint64_t value) noexcept {
+        if constexpr (std::endian::native == std::endian::big) {
+            value = std::byteswap(value);
+        }
+        std::memcpy(bytes, &value, sizeof(value));
+    }
+
+    // One MD5 step. The four state words rotate through the (target, x, y, z) roles with I % 4, which is what makes the 64 steps a straight-line sequence.
+    // step I writes the slot that step I - 1 read as x, so no register shuffling is needed.
+    template <std::size_t I>
+    inline void Step(std::uint32_t& a, std::uint32_t& b, std::uint32_t& c, std::uint32_t& d, const std::byte* block) noexcept {
+        constexpr std::size_t round = I / 16;
+        constexpr std::uint32_t k = kRoundConstants[I];
+        constexpr std::uint32_t g = kMessageIndex[I];
+        constexpr int shift = static_cast<int>(kRotations[I]);
+
+        std::uint32_t& target = (I % 4 == 0) ? a :
+                                (I % 4 == 1) ? d :
+                                (I % 4 == 2) ? c :
+                                b;
+        std::uint32_t& x =  (I % 4 == 0) ? b :
+                            (I % 4 == 1) ? a :
+                            (I % 4 == 2) ? d :
+                            c;
+        std::uint32_t& y =  (I % 4 == 0) ? c :
+                            (I % 4 == 1) ? b :
+                            (I % 4 == 2) ? a :
+                            d;
+        std::uint32_t& z =  (I % 4 == 0) ? d :
+                            (I % 4 == 1) ? c :
+                            (I % 4 == 2) ? b :
+                            a;
+
+        // The ternary forms use the same number of operations as (x & y) | (~x & z) but keep the complement off the critical path.
+        std::uint32_t f = 0;
+        if constexpr (round == 0) {
+            f = z ^ (x & (y ^ z));
+        } else if constexpr (round == 1) {
+            f = y ^ (z & (x ^ y));
+        } else if constexpr (round == 2) {
+            f = x ^ y ^ z;
+        } else {
+            f = y ^ (x | ~z);
+        }
+
+        target += f + k + LoadLe32(block + 4 * g);
+        target = std::rotl(target, shift);
+        target += x;
+    }
+
+    // A function template rather than a generic lambda: GCC declines to inline a 600-instruction closure,
+    // and the by-reference captures then force the state through memory, which measures 25 % slower.
+    // See docs/md5-optimization.md.
+    template <std::size_t... I>
+    HASHLIB_ALWAYS_INLINE void RunSteps(std::index_sequence<I...>, std::uint32_t& a,
+                                        std::uint32_t& b, std::uint32_t& c, std::uint32_t& d,
+                                        const std::byte* block) noexcept {
+        (Step<I>(a, b, c, d, block), ...);
+    }
+
+    // Out of line on purpose.
+    // one copy of the 64-step body instead of one per call site, and taking the state by value keeps a, b, c, d in registers across the whole message instead of round-tripping them through memory once per block.
+    HASHLIB_NOINLINE State Compress(State state, const std::byte* blocks, std::size_t blockCount) noexcept {
+        std::uint32_t a = state.a;
+        std::uint32_t b = state.b;
+        std::uint32_t c = state.c;
+        std::uint32_t d = state.d;
+
+        for (std::size_t block = 0; block < blockCount; ++block, blocks += kBlockBytes) {
+            const std::uint32_t aBeforeBlock = a;
+            const std::uint32_t bBeforeBlock = b;
+            const std::uint32_t cBeforeBlock = c;
+            const std::uint32_t dBeforeBlock = d;
+
+            RunSteps(std::make_index_sequence<64>{}, a, b, c, d, blocks);
+
+            a += aBeforeBlock;
+            b += bBeforeBlock;
+            c += cBeforeBlock;
+            d += dBeforeBlock;
+        }
+
+        return State{a, b, c, d};
+    }
+
+}  // anonymous namespace
+
+Digest md5_fast(std::span<const std::byte> input) noexcept {
+    const std::size_t blockCount = input.size() / kBlockBytes;
+    const std::size_t remainder = input.size() - blockCount * kBlockBytes;
+
+    // Full blocks are hashed straight out of the caller's buffer: no copy.
+    State state = Compress(State{}, input.data(), blockCount);
+
+    // Only the trailing one or two blocks go through a zeroed stack buffer.
+    std::byte tail[2 * kBlockBytes] = {};
+    if (remainder != 0) {
+        std::memcpy(tail, input.data() + blockCount * kBlockBytes, remainder);
+    }
+    tail[remainder] = std::byte{0x80};
+    const std::size_t tailBlocks = (remainder + 9 <= kBlockBytes) ? 1 : 2;  // 0x80 + 8-byte length
+    StoreLe64(tail + tailBlocks * kBlockBytes - 8, static_cast<std::uint64_t>(input.size()) * 8);
+
+    state = Compress(state, tail, tailBlocks);
+
+    Digest digest{};
+    StoreLe32(digest.data() + 0, state.a);
+    StoreLe32(digest.data() + 4, state.b);
+    StoreLe32(digest.data() + 8, state.c);
+    StoreLe32(digest.data() + 12, state.d);
+    return digest;
+}
+
+#undef HASHLIB_ALWAYS_INLINE
+#undef HASHLIB_NOINLINE
+
 }  // namespace hashlib

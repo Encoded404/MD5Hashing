@@ -19,4 +19,16 @@ using Digest = std::array<std::byte, 16>;
 /// and not as a streaming hash API.
 [[nodiscard]] Digest naive_md5(std::span<const std::byte> input);
 
+/// Computes the MD5 digest of the raw bytes in `input`.
+///
+/// The optimised counterpart of `naive_md5`, with the same result for every input.
+/// Full 64-byte blocks are read straight out of the caller's buffer, so nothing is allocated.
+/// the function is `noexcept`; only the trailing one or two blocks go through a 128-byte stack buffer.
+/// All 64 steps are expanded at compile time, so the round constant, the rotation amount and the message index are constants,
+/// and the state is passed by value so it stays in registers for the whole message.
+/// Roughly 3x the throughput of `naive_md5`. see `docs/md5-optimization.md` for the measurements behind each choice.
+///
+/// Not a streaming API.
+[[nodiscard]] Digest md5_fast(std::span<const std::byte> input) noexcept;
+
 }  // namespace hashlib

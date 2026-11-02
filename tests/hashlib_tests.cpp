@@ -19,6 +19,15 @@ namespace {
     return true;
 }();
 
+using Md5Function = hashlib::Digest (*)(std::span<const std::byte>);
+
+// Every MD5 implementation the library exports. Adding one to hashlib means
+// adding a row here, and then every known-answer and boundary test covers it.
+constexpr std::array kImplementations{
+    std::pair{std::string_view{"naive_md5"}, Md5Function{hashlib::naive_md5}},
+    std::pair{std::string_view{"md5_fast"}, Md5Function{hashlib::md5_fast}},
+};
+
 std::string ToHex(std::span<const std::byte> bytes) {
     static constexpr char kHexDigits[] = "0123456789abcdef";
 
@@ -32,9 +41,9 @@ std::string ToHex(std::span<const std::byte> bytes) {
     return text;
 }
 
-std::string Md5Hex(std::string_view text) {
+std::string Md5Hex(std::string_view text, Md5Function function) {
     const std::span<const std::byte> input = std::as_bytes(std::span{text.data(), text.size()});
-    return ToHex(hashlib::naive_md5(input));
+    return ToHex(function(input));
 }
 
 }  // namespace
@@ -56,9 +65,12 @@ TEST(HashLibTest, Md5KnownAnswerVectors) {
                   std::string_view{"57edf4a22be3c955ac49da2e2107b67a"}},
     };
 
-    for (const auto& [input, expected] : kCases) {
-        SCOPED_TRACE(std::string(input));
-        EXPECT_EQ(Md5Hex(input), expected);
+    for (const auto& [name, function] : kImplementations) {
+        SCOPED_TRACE(std::string(name));
+        for (const auto& [input, expected] : kCases) {
+            SCOPED_TRACE(std::string(input));
+            EXPECT_EQ(Md5Hex(input, function), expected);
+        }
     }
 }
 
@@ -74,10 +86,13 @@ TEST(HashLibTest, Md5PaddingBoundaries) {
         std::pair{1000U, std::string_view{"cabe45dcc9ae5b66ba86600cca6b8ba8"}},
     };
 
-    for (const auto& [length, expected] : kCases) {
-        SCOPED_TRACE(std::to_string(length));
-        const std::string input(length, 'a');
-        EXPECT_EQ(Md5Hex(input), expected);
+    for (const auto& [name, function] : kImplementations) {
+        SCOPED_TRACE(std::string(name));
+        for (const auto& [length, expected] : kCases) {
+            SCOPED_TRACE(std::to_string(length));
+            const std::string input(length, 'a');
+            EXPECT_EQ(Md5Hex(input, function), expected);
+        }
     }
 }
 
@@ -87,5 +102,39 @@ TEST(HashLibTest, Md5PaddingBoundaries) {
 // and produces exactly 65,536 blocks.
 TEST(HashLibTest, Md5HandlesMoreThan64KBlocks) {
     const std::string input(4'194'232, 'a');
-    EXPECT_EQ(Md5Hex(input), "a650f836e82882751694e0c25736af2c");
+    for (const auto& [name, function] : kImplementations) {
+        SCOPED_TRACE(std::string(name));
+        EXPECT_EQ(Md5Hex(input, function), "a650f836e82882751694e0c25736af2c");
+    }
+}
+
+// The implementations must agree for every length, including the lengths where
+// the padded tail needs an extra block. This is the property that lets the CLI
+// run several of them by default and compare the results.
+TEST(HashLibTest, Md5ImplementationsAgree) {
+    for (std::size_t length = 0; length <= 200; ++length) {
+        SCOPED_TRACE(std::to_string(length));
+        const std::string input(length, static_cast<char>('a' + length % 26));
+
+        const hashlib::Digest reference = hashlib::naive_md5(
+            std::as_bytes(std::span{input.data(), input.size()}));
+        for (const auto& [name, function] : kImplementations) {
+            SCOPED_TRACE(std::string(name));
+            EXPECT_EQ(function(std::as_bytes(std::span{input.data(), input.size()})), reference);
+        }
+    }
+}
+
+// Binary input, not just text: the span API takes raw bytes.
+TEST(HashLibTest, Md5HandlesBinaryBytes) {
+    std::array<std::byte, 256> input{};
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<std::byte>(i);
+    }
+
+    const hashlib::Digest reference = hashlib::naive_md5(input);
+    for (const auto& [name, function] : kImplementations) {
+        SCOPED_TRACE(std::string(name));
+        EXPECT_EQ(function(input), reference);
+    }
 }
