@@ -47,14 +47,18 @@ import hashlib;
 
 const std::string_view text = "hello";
 const hashlib::Digest digest =
-    hashlib::md5(std::as_bytes(std::span{text.data(), text.size()}));  // std::array<std::byte, 16>
+    hashlib::naive_md5(std::as_bytes(std::span{text.data(), text.size()}));  // std::array<std::byte, 16>
 ```
 
 `hashlib::Digest` is the raw 16-byte result; format it as hex (or base64) at the
 call site if a printable representation is needed.
 
-The MD5 core is intentionally not implemented yet; the placeholder throws
-`std::logic_error` until the algorithm lands.
+`naive_md5` is a deliberately naive, single-shot implementation that follows the
+Wikipedia pseudocode closely: it copies and pads the whole input in memory and
+favours readability over speed. It is intended for learning and benchmarking,
+not as a security primitive (MD5 is cryptographically broken) and not as a
+streaming hash API. Known-answer tests (RFC 1321 plus padding and
+large-input edges) live in `tests/hashlib_tests.cpp`.
 
 ## Prerequisites
 
