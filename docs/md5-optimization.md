@@ -143,6 +143,164 @@ generic.
 If `-march=native` is used in this project, pin `-mtune=generic` for the hash
 target and re-measure after compiler upgrades.
 
+## GCC vs Clang
+
+The same `md5_fast` source, four builds, 1 MiB payload:
+
+| build | naive | four loops | fully unrolled | 55 B (unrolled) |
+|---|---|---|---|---|
+| gcc `-mtune=generic` | 0.87 | 1.16 | **1.16** | 57 ns |
+| gcc `-march=native` | 0.91 | 0.96 | 0.96 | 67 ns |
+| clang `-march=native` | 0.77 | 0.93 | 1.04 | 61 ns |
+| clang `-mtune=generic` | 0.78 | 0.79 | 0.96 | 66 ns |
+
+Best to worst is a ratio of 1.22, and it is not "Clang is faster" or "GCC is faster": each
+compiler has a machine model that happens to be good or bad for this kernel.
+GCC's `znver5` (what `-march=native` implies) costs 17% against
+`-mtune=generic`; Clang's `generic` costs 8% against its native `znver5`.
+
+Disabling the schedulers does not move anything (GCC 1.16 with
+`-fno-schedule-insns2`, Clang 1.04 with `-mllvm -enable-misched=false`), and
+neither does loop alignment. It is a code-shape difference, and it comes down to
+one thing: **how many cycles of dependent work sit between the round function
+and the rotate**.
+
+### Zen 5 dependent-op latencies
+
+Measured with a chain of the same instruction, 10 per iteration, against the
+5.51 GHz the same harness reports for a dependent `add`:
+
+| op | cycles |
+|---|---|
+| `add`, `rol r,imm`, `rorx r,imm` | 1 |
+| `lea` with base + index | 1 |
+| `lea` with base + index + displacement | **2** |
+
+The 3-component `lea` is the one that matters. Every implementation wants to
+compute `a + X[k] + K[i]` in one instruction, and that is exactly the 2-cycle
+form. It is free when the operand is the old `a`, and it costs a cycle when the
+operand is the value the previous step just produced.
+
+### The four shapes
+
+GCC `-mtune=generic`, 1.16 GB/s. The `lea` runs off the critical path and a
+single `add` joins it to the round function:
+
+```
+lea  -0x28955b88(%r12,%rdi,1),%edx   ; a + X[0] + K[0], a is three steps old
+add  %edx,%eax                       ; + F
+rorx $0x19,%eax,%eax
+add  %r8d,%eax                       ; + b
+```
+
+GCC `-mtune=znver5`, 0.95 GB/s. It knows the 3-component `lea` is 2 cycles, so
+it rearranges to give the `lea` fewer inputs — and puts it after the `add`,
+which now depends on `F`, which depends on the fresh `a`:
+
+```
+add  %r12d,%eax                      ; F + a      <- on the chain
+lea  -0x28955b88(%rsi,%rax,1),%ecx   ; + X + K    <- 2 cycles, on the chain
+rorx $0x19,%ecx,%ecx
+add  %edi,%ecx
+```
+
+Clang `-march=native`, 1.04 GB/s, one `lea` but on the chain:
+
+```
+add  %esi,%ecx
+lea  -0x28955b88(%rax,%rcx,1),%eax   ; 2 cycles, index is the fresh value
+rorx $0x19,%eax,%eax
+add  -0x78(%rsp),%eax
+```
+
+Clang `-mtune=generic`, 0.96 GB/s, no folding at all — and 254 `add`s per block
+against 133 for GCC:
+
+```
+add  %esi,%ecx
+lea  (%rbx,%rcx,1),%eax              ; + X
+add  $0xd76aa478,%eax                ; + K, second dependent op
+rorx $0x19,%eax,%eax
+add  -0x78(%rsp),%eax
+```
+
+So the ranking follows the chain length exactly: 1 op after `F` (1.16) beats one
+2-cycle `lea` after `F` (1.04) beats two dependent ops (0.96) beats an `add` plus
+a 2-cycle `lea` (0.95).
+
+The 4.75 cycles per step that 1.16 GB/s works out to at 5.51 GHz is the
+structural floor: rounds 1, 2 and 4 need two operations on the accumulator
+before the rotate and round 3 needs one, `(16*5 + 16*5 + 16*4 + 16*5) / 64 =
+4.75`.
+
+### Clang's spilling
+
+Clang spills about 30 values per block — 60 stack references inside the loop body
+against 4 to 6 for GCC:
+
+```
+mov  %rdx,-0x18(%rsp)
+mov  %r10,-0x10(%rsp)
+mov  %rdi,-0x20(%rsp)
+and  -0x78(%rsp),%ecx
+```
+
+The spills are mostly message words loaded early for later steps, so they sit off
+the critical path and cost far less than the count suggests — but they do not
+help. The 64-bit stores (`mov %rsi,-0x58(%rsp)` for a 32-bit word) are the
+allocator parking the value rather than rematerialising the load.
+
+## Against OpenSSL
+
+OpenSSL's `md5_block_asm_data_order` is the perlasm implementation, reachable
+through `MD5_Transform`. Measured in the same process, alternating between the
+two implementations so both see the same clock:
+
+| | 1 KiB | 64 KiB | 1 MiB |
+|---|---|---|---|
+| `md5_fast` (gcc `-mtune=generic`) | 1.080 | 1.162 | 1.166 |
+| OpenSSL `MD5()` | 1.131 | 1.227 | 1.231 |
+| ratio | 1.047 | 1.056 | 1.056 |
+
+`bench/md5_ab.cpp` reproduces this. The ratio is flat from 64 KiB up, so it is a
+per-step cost and not a memory effect; 1 KiB is slightly closer only because
+`MD5()` pays more per-call setup, which flatters the comparison for us. Coarse
+interleaving (64 MiB per switch) gives the same 1.056 as 1 MiB per switch, so
+this is cycles and not clock. The gap is 5.6%, or about 0.3 cycles per step.
+
+The surprising part is the instruction count:
+
+| | instructions per block | per step | stack refs in loop |
+|---|---|---|---|
+| gcc `-mtune=generic` | 554 | 8.66 | 4 |
+| clang `-march=native` | 564 | 8.81 | 60 |
+| clang `-mtune=generic` | 623 | 9.73 | 61 |
+| OpenSSL | 610 | **9.53** | 0 |
+
+OpenSSL emits 10% *more* instructions per step than GCC and is 5.6% faster. It is
+not minimizing work, it is minimizing depth, and the extra instructions are the
+ones that keep old values available:
+
+- Every message word is loaded immediately before the step that uses it — 64
+  loads, at most 10 instructions ahead of the first use, median 7. GCC hoists
+  loads up to 103 instructions early (median 7, mean 10), so a word can be live
+  long before the round that consumes it. That is where Clang's 60 stack
+  references come from; GCC avoids them by having more registers to park things
+  in, not by being cleverer.
+- Roles are rotated by emitting the unrolled text with different registers per
+  step, with no `mov` for the rotation.
+
+Neither compiler is doing anything stupid; both are optimising instruction count
+and register pressure, which is the right default and the wrong objective for a
+64-step serial chain.
+
+The chain itself is identical — `lea`, `add F`, `rol`, `add b` — so the 5.6% is
+not a shorter recurrence; it is where the critical operation lands in the
+cycle-by-cycle schedule. That is also why 1.16 GB/s is
+close enough to 1.23 to stop: a compiler reaching 95% of perlasm on a 64-step
+serial chain is unusual, and the remaining 5.6% is not available from the C++
+side without hand-written assembly.
+
 ## Smaller findings
 
 - `__builtin_prefetch(p + 64)` before each block changes nothing: no change at
