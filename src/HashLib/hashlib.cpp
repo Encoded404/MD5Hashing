@@ -108,8 +108,8 @@ Digest naive_md5(std::span<const std::byte> input) {
         D += D_inner;
     }
 
-    const Digest zero = utilities::PackValues(A, B, C, D);
-    return zero;
+    const Digest result = utilities::PackValues(A, B, C, D);
+    return result;
 }
 
 }  // namespace hashlib
