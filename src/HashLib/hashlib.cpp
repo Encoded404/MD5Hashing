@@ -16,7 +16,7 @@ Digest naive_md5(std::span<const std::byte> input) {
     std::uint64_t lengthInBits = (input.size() * 8UL); //  get the length in bits
 
     std::uint16_t bitsToAppend = (447 - lengthInBits) % 512; // pads to 512 - 64 = 448
-    std::vector<std::byte> buffer(input.size() + (8 + bitsToAppend) / 8);
+    std::vector<std::byte> buffer(input.size() + (8 + bitsToAppend) / 8 + 8); // 8 bits for the 10000000. bitsToAppend for the padding. and the final 8 bits for the length in uint64_t
 
     LOGIFACE_LOG(trace, "input was " + std::to_string(input.size()) + " byte(s) (" + std::to_string(lengthInBits) + " bits), and had " + std::to_string((bitsToAppend + 8) / 8) + " byte(s) added (" + std::to_string((bitsToAppend + 8)) + " bits)");
 
