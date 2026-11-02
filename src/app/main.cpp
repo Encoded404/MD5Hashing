@@ -119,7 +119,6 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
 void initializeLogger(Logiface::Level level) {
     static Logiface::ConsoleLogger app_logger;
     app_logger.SetLevel(level);
@@ -129,10 +128,6 @@ void initializeLogger(Logiface::Level level) {
 void BasicHash(std::span<const std::byte> input) {
     LOGIFACE_LOG(info, "Hashing " + std::to_string(input.size()) + " byte(s)");
 
-    try {
-        const hashlib::Digest digest = hashlib::naive_md5(input);
-        LOGIFACE_LOG(info, "md5 = " + ToHex(digest));
-    } catch (const std::logic_error& error) {
-        LOGIFACE_LOG(warn, std::string("md5 unavailable: ") + error.what());
-    }
+    const hashlib::Digest digest = hashlib::naive_md5(input);
+    LOGIFACE_LOG(info, "md5 = " + ToHex(digest));
 }
