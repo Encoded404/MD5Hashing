@@ -12,8 +12,11 @@ using Digest = std::array<std::byte, 16>;
 /// Accepts any contiguous byte range; wrap text or binary buffers with
 /// `std::as_bytes(std::span{...})` at the call site.
 ///
-/// The MD5 core is not implemented yet; until it lands this function throws
-/// `std::logic_error`. The declaration below is the intended call surface.
+/// This is a deliberately naive, single-shot implementation that follows the
+/// Wikipedia pseudocode closely: it copies and pads the whole input in memory
+/// and favours readability over speed. It is intended for learning and
+/// benchmarking, not as a security primitive (MD5 is cryptographically broken)
+/// and not as a streaming hash API.
 [[nodiscard]] Digest naive_md5(std::span<const std::byte> input);
 
 }  // namespace hashlib
