@@ -34,9 +34,8 @@ Digest naive_md5(std::span<const std::byte> input) {
     std::uint32_t C = 0x98badcfe;
     std::uint32_t D = 0x10325476;
 
-    std::uint16_t blocks = buffer.size() / (512>>3); // get how many 512 bit blocks there are.
-    for (std::uint16_t chunk = 0; chunk < blocks; chunk++) {
-        std::vector<std::uint32_t> buffers(16);
+    std::size_t blocks = buffer.size() / (512>>3); // get how many 512 bit blocks there are.
+    for (std::size_t chunk = 0; chunk < blocks; chunk++) {
 
         std::array<std::byte, 64> block{};
         std::memcpy(block.data(), buffer.data() + chunk * 64, 64);
