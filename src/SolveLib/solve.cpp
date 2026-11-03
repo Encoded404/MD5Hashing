@@ -93,7 +93,7 @@ private:
 // Compressed and UTF-16 files are rejected with an actionable message, rather than being silently read as mojibake.
 class WordlistReader {
 public:
-    explicit WordlistReader(std::filesystem::path path)
+    explicit WordlistReader(const std::filesystem::path& path)
         : file_(path, std::ios::binary) {
         if (!file_) {
             error_ = "cannot open wordlist: " + path.string();
