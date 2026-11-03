@@ -21,16 +21,29 @@ if(CMAKE_CONFIGURATION_TYPES)
     )
 endif()
 
-# Optional per-machine tuning for the hash core only (HASHLIB_NATIVE_TUNING).
-# The kernel is a serial dependency chain, so it is unusually sensitive to the
-# scheduler; -mtune=generic is pinned because the native tuning models measured
-# worse for this loop on GCC. Skipped when cross-compiling, where -march=native
-# would describe the build host rather than the target.
+# Optional per-machine tuning (HASHLIB_NATIVE_TUNING).
+#
+# -mtune=generic is pinned next to -march=native because on GCC -march=native
+# implies -mtune=znver5, which measured 20% slower for the MD5 core before the
+# Pin barrier removed the tuning sensitivity (see docs/md5-optimization.md).
+# Skipped when cross-compiling, where -march=native would describe the build
+# host rather than the target.
+#
+# The flags go on an INTERFACE target linked PUBLIC rather than on the library
+# PRIVATE, because they have to reach every translation unit that imports
+# `hashlib`. A Clang module BMI records the target features it was built with,
+# and importing it from a TU with a different feature set is a hard error
+# ("precompiled file ... was compiled with the target feature '+avx512f' but the
+# current translation unit is not"). The interface target carries the options to
+# HashApp and hashlib_tests through the library's usage requirements, which is
+# what makes this option buildable with Clang.
 if(HASHLIB_NATIVE_TUNING AND NOT CMAKE_CROSSCOMPILING)
-    target_compile_options(${HASH_LIBRARY_TARGET} PRIVATE
+    add_library(hashlib_arch_flags INTERFACE)
+    target_compile_options(hashlib_arch_flags INTERFACE
         $<$<CXX_COMPILER_ID:GNU,Clang>:-march=native>
         $<$<CXX_COMPILER_ID:GNU,Clang>:-mtune=generic>
     )
+    target_link_libraries(${HASH_LIBRARY_TARGET} PUBLIC hashlib_arch_flags)
 endif()
 
 # Module files.
