@@ -94,7 +94,7 @@ private:
 class WordlistReader {
 public:
     explicit WordlistReader(std::filesystem::path path)
-        : file_(std::move(path), std::ios::binary) {
+        : file_(path, std::ios::binary) {
         if (!file_) {
             error_ = "cannot open wordlist: " + path.string();
             return;
