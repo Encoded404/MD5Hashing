@@ -29,6 +29,7 @@ endif()
 
 set(PROJECT_NAME "HashApp")
 set(HASH_LIBRARY_TARGET "HashLib")
+set(TIMER_LIBRARY_TARGET "TimerLib")
 set(SOLVE_LIBRARY_TARGET "SolveLib")
 set(APP_TARGET "HashApp")
 

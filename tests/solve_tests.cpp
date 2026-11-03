@@ -95,6 +95,21 @@ TEST(SolveTest, PermutationsRecoverTheWord) {
     EXPECT_GT(outcome.stats.candidates, 0u);
 }
 
+TEST(SolveTest, RunsAPrecomputedPlan) {
+    solve::SearchProblem problem;
+    problem.target.digest = DigestOf("listen");
+    problem.anagram = solve::Anagram{"silent"};
+
+    std::string error;
+    const std::optional<solve::Plan> plan = solve::PlanSearch(problem, "permutations", error);
+    ASSERT_TRUE(plan.has_value()) << error;
+
+    const solve::Outcome outcome = solve::Solve(problem, *plan);
+    ASSERT_EQ(outcome.status, solve::Status::found);
+    ASSERT_TRUE(outcome.solution.has_value());
+    EXPECT_EQ(outcome.solution->candidate, "listen");
+}
+
 TEST(SolveTest, PermutationsOnlyEmitDistinctArrangements) {
     solve::SearchProblem problem;
     problem.target.digest = DigestOf("aab");

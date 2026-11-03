@@ -2,15 +2,22 @@ module solve;
 
 import std;
 import hashlib;
+import Timer;
 
 namespace {
 
 constexpr std::size_t kBatchSize = 64;
 constexpr std::size_t kMaxPhraseUnique = 32;
-constexpr std::size_t kMaxPhraseWords = 8;
+constexpr std::size_t kMaxPhraseWords = solve::kMaxPhraseWords;
 constexpr std::uint8_t kNoIndex = 0xFF;
 constexpr std::uint64_t kPhraseNodeBudget = 100'000'000;
 constexpr std::uint64_t kMaxU64 = std::numeric_limits<std::uint64_t>::max();
+
+#if defined(SOLVE_TIMING) && SOLVE_TIMING
+constexpr bool kTimingEnabled = true;
+#else
+constexpr bool kTimingEnabled = false;
+#endif
 
 std::uint64_t SaturatingMultiply(std::uint64_t left, std::uint64_t right) {
     if (left != 0 && right > kMaxU64 / left) {
@@ -54,8 +61,9 @@ public:
     virtual ~CandidateSource() = default;
 
     /// Fills up to out.size() candidates; returns how many were written.
-    /// Zero means the source is exhausted.
-    virtual std::size_t next_batch(std::span<std::string> out) = 0;
+    /// Zero means the source is exhausted. Sub-phase timings go into `generate`.
+    virtual std::size_t next_batch(std::span<std::string> out,
+                                   solve::Timing::Generate& generate) = 0;
 
     /// Work performed so far: permutations generated or wordlist lines read.
     [[nodiscard]] virtual std::uint64_t scanned() const { return 0; }
@@ -63,12 +71,16 @@ public:
 
 class PermutationSource final : public CandidateSource {
 public:
-    explicit PermutationSource(std::string letters) : current_(std::move(letters)) {
+    PermutationSource(std::string letters, Timer::Timer& setup_timer)
+        : current_(std::move(letters)) {
+        [[maybe_unused]] const Timer::ScopedTimer setup(setup_timer, kTimingEnabled);
         std::ranges::sort(current_);
     }
 
-    std::size_t next_batch(std::span<std::string> out) override {
+    std::size_t next_batch(std::span<std::string> out,
+                           solve::Timing::Generate& generate) override {
         std::size_t count = 0;
+        [[maybe_unused]] const Timer::ScopedTimer phase(generate.permute, kTimingEnabled);
         while (count < out.size() && !done_) {
             out[count++] = current_;
             ++generated_;
@@ -201,8 +213,10 @@ private:
 
 class DictionarySource final : public CandidateSource {
 public:
-    DictionarySource(std::filesystem::path path, std::string_view letters)
+    DictionarySource(std::filesystem::path path, std::string_view letters,
+                     Timer::Timer& setup_timer)
         : reader_(std::move(path)), target_length_(letters.size()) {
+        [[maybe_unused]] const Timer::ScopedTimer setup(setup_timer, kTimingEnabled);
         for (const unsigned char ch : letters) {
             ++counts_[ch];
         }
@@ -211,16 +225,30 @@ public:
     [[nodiscard]] bool is_open() const { return reader_.is_open() && reader_.error().empty(); }
     [[nodiscard]] const std::string& error() const { return reader_.error(); }
 
-    std::size_t next_batch(std::span<std::string> out) override {
+    std::size_t next_batch(std::span<std::string> out,
+                           solve::Timing::Generate& generate) override {
         std::size_t count = 0;
         std::string token;
+        const std::chrono::nanoseconds filter_before = generate.filter;
+        Timer::Timer batch_timer(kTimingEnabled);
         while (count < out.size() && reader_.next(token)) {
             ++scanned_;
-            if (token.size() != target_length_ || !SameMultiset(token)) {
-                continue;
+            {
+                [[maybe_unused]] const Timer::ScopedTimer phase(generate.filter, kTimingEnabled);
+                if (token.size() != target_length_ || !SameMultiset(token)) {
+                    continue;
+                }
+                out[count++] = token;
             }
-            out[count++] = token;
         }
+        batch_timer.Stop();
+        // The batch timer covers the whole loop; what is left after the filter
+        // scopes is reading/tokenizing the wordlist.
+        const std::chrono::nanoseconds filter_elapsed = generate.filter - filter_before;
+        const std::chrono::nanoseconds batch_elapsed = batch_timer.ElapsedDuration();
+        generate.scan += batch_elapsed > filter_elapsed
+                             ? batch_elapsed - filter_elapsed
+                             : std::chrono::nanoseconds{0};
         return count;
     }
 
@@ -282,8 +310,11 @@ struct PhraseWord {
 
 class PhraseSearch {
 public:
-    PhraseSearch(const solve::SearchProblem& problem, std::string_view phrase)
-        : target_(problem.target.digest), max_candidates_(problem.max_candidates) {
+    PhraseSearch(const solve::SearchProblem& problem, std::string_view phrase,
+                 Timer::Timer& setup_timer, solve::Timing& timing, solve::Counters& counters)
+        : target_(problem.target.digest), max_candidates_(problem.max_candidates),
+          timing_(&timing), counters_(&counters) {
+        [[maybe_unused]] const Timer::ScopedTimer setup(setup_timer, kTimingEnabled);
         if (!problem.wordlist) {
             error_ = "the phrase solver requires a wordlist (--wordlist)";
             return;
@@ -410,13 +441,33 @@ public:
         }
 
         prefix_.reserve(total_letters_ + max_words_ - 1);
-        const auto start = std::chrono::steady_clock::now();
+        Timer::Timer search_timer(true);
         DfsResult result = DfsResult::exhausted;
         for (std::size_t words = 2; words <= max_words_; ++words) {
             remaining_counts_ = target_counts_;
             remaining_length_ = total_letters_;
             prefix_.clear();
+            [[maybe_unused]] const std::chrono::nanoseconds hash_before =
+                hash_timer_.ElapsedDuration();
+            [[maybe_unused]] const std::chrono::nanoseconds match_before =
+                match_timer_.ElapsedDuration();
+            [[maybe_unused]] const std::chrono::nanoseconds prepare_before =
+                timing_->generate.prepare;
+            Timer::Timer level_timer(kTimingEnabled);
             result = dfs(words, target_key_);
+            level_timer.Stop();
+            if constexpr (kTimingEnabled) {
+                // The level timer includes hash/match/prepare; take those out
+                // so the per-depth values add up to `generate.dfs`.
+                const std::chrono::nanoseconds nested =
+                    (hash_timer_.ElapsedDuration() - hash_before) +
+                    (match_timer_.ElapsedDuration() - match_before) +
+                    (timing_->generate.prepare - prepare_before);
+                const std::chrono::nanoseconds level_total = level_timer.ElapsedDuration();
+                timing_->generate.dfs_by_word_count[words - 2] +=
+                    level_total > nested ? level_total - nested
+                                         : std::chrono::nanoseconds{0};
+            }
             if (result != DfsResult::exhausted) {
                 break;
             }
@@ -427,12 +478,22 @@ public:
                 result = flushed;
             }
         }
-        outcome.stats = solve::Stats{
-            hashed_,
-            nodes_,
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start),
-        };
+        search_timer.Stop();
+        const std::chrono::nanoseconds search_elapsed = search_timer.ElapsedDuration();
+        outcome.stats = solve::Stats{hashed_, nodes_, search_elapsed};
+        if constexpr (kTimingEnabled) {
+            const std::chrono::nanoseconds hash_elapsed = hash_timer_.ElapsedDuration();
+            const std::chrono::nanoseconds match_elapsed = match_timer_.ElapsedDuration();
+            // Hashing, comparison and span preparation happen inside the DFS
+            // (flush), so the traversal is the search time minus those nested
+            // phases.
+            const std::chrono::nanoseconds nested =
+                hash_elapsed + match_elapsed + timing_->generate.prepare;
+            timing_->generate.dfs =
+                search_elapsed > nested ? search_elapsed - nested : std::chrono::nanoseconds{0};
+            timing_->hash = hash_elapsed;
+            timing_->match = match_elapsed;
+        }
 
         switch (result) {
             case DfsResult::found:
@@ -517,6 +578,9 @@ private:
         if (max_candidates_ != 0 && hashed_ >= max_candidates_) {
             return DfsResult::candidate_budget;
         }
+        if constexpr (kTimingEnabled) {
+            ++counters_->phrases_emitted;
+        }
         batch_[batch_count_++] = prefix_;
         if (batch_count_ == batch_.size()) {
             return flush();
@@ -531,18 +595,29 @@ private:
 
         std::array<std::span<const std::byte>, kBatchSize> inputs{};
         std::array<solve::Digest, kBatchSize> digests{};
-        for (std::size_t i = 0; i < batch_count_; ++i) {
-            inputs[i] = std::as_bytes(std::span{batch_[i].data(), batch_[i].size()});
+        {
+            [[maybe_unused]] const Timer::ScopedTimer phase(timing_->generate.prepare,
+                                                            kTimingEnabled);
+            for (std::size_t i = 0; i < batch_count_; ++i) {
+                inputs[i] = std::as_bytes(std::span{batch_[i].data(), batch_[i].size()});
+            }
         }
-        hashlib::md5_batch(std::span<const std::span<const std::byte>>{inputs.data(), batch_count_},
-                           std::span<solve::Digest>{digests.data(), batch_count_});
+        {
+            [[maybe_unused]] const Timer::ScopedTimer phase(hash_timer_, kTimingEnabled);
+            hashlib::md5_batch(
+                std::span<const std::span<const std::byte>>{inputs.data(), batch_count_},
+                std::span<solve::Digest>{digests.data(), batch_count_});
+        }
 
-        for (std::size_t i = 0; i < batch_count_; ++i) {
-            if (digests[i] == target_) {
-                phrase_ = batch_[i];
-                hashed_ += batch_count_;
-                batch_count_ = 0;
-                return DfsResult::found;
+        {
+            [[maybe_unused]] const Timer::ScopedTimer phase(match_timer_, kTimingEnabled);
+            for (std::size_t i = 0; i < batch_count_; ++i) {
+                if (digests[i] == target_) {
+                    phrase_ = batch_[i];
+                    hashed_ += batch_count_;
+                    batch_count_ = 0;
+                    return DfsResult::found;
+                }
             }
         }
         hashed_ += batch_count_;
@@ -556,14 +631,23 @@ private:
         }
 
         if (words_left == 1) {
+            if constexpr (kTimingEnabled) {
+                ++counters_->leaf_visits;
+            }
             const auto bucket = by_key_.find(remaining_key);
             if (bucket == by_key_.end()) {
                 return DfsResult::exhausted;
             }
             for (const std::uint32_t index : bucket->second) {
+                if constexpr (kTimingEnabled) {
+                    ++counters_->leaf_candidates;
+                }
                 const PhraseWord& word = words_[index];
                 if (!SameCounts(word)) {
                     continue;
+                }
+                if constexpr (kTimingEnabled) {
+                    ++counters_->same_counts_hits;
                 }
                 const std::size_t old_size = prefix_.size();
                 prefix_ += word.text;
@@ -577,8 +661,14 @@ private:
         }
 
         for (const PhraseWord& word : words_) {
+            if constexpr (kTimingEnabled) {
+                ++counters_->fits_calls;
+            }
             if (!Fits(word)) {
                 continue;
+            }
+            if constexpr (kTimingEnabled) {
+                ++counters_->fits_passes;
             }
             const std::size_t remaining_after = remaining_length_ - word.text.size();
             if (remaining_after < (words_left - 1) * min_word_length_) {
@@ -592,6 +682,9 @@ private:
             const std::size_t old_size = prefix_.size();
             prefix_ += word.text;
             prefix_ += ' ';
+            if constexpr (kTimingEnabled) {
+                ++counters_->edges;
+            }
             const DfsResult result = dfs(words_left - 1, remaining_key - word.key);
             prefix_.resize(old_size);
             Add(word);
@@ -604,6 +697,10 @@ private:
 
     solve::Digest target_{};
     std::uint64_t max_candidates_ = 0;
+    solve::Timing* timing_ = nullptr;
+    solve::Counters* counters_ = nullptr;
+    Timer::Timer hash_timer_;
+    Timer::Timer match_timer_;
     std::string error_;
     std::size_t max_words_ = 0;
     std::size_t total_letters_ = 0;
@@ -629,20 +726,25 @@ private:
 };
 
 solve::Outcome RunEngine(const solve::SearchProblem& problem, CandidateSource& source,
-                         std::string_view solver_id) {
+                         std::string_view solver_id, solve::Timing& timing) {
     std::array<std::string, kBatchSize> candidates;
     std::array<std::span<const std::byte>, kBatchSize> inputs{};
     std::array<solve::Digest, kBatchSize> digests{};
 
+    Timer::Timer hash_timer;
+    Timer::Timer match_timer;
+    Timer::Timer search_timer(true);
     std::uint64_t hashed = 0;
-    const auto start = std::chrono::steady_clock::now();
     const auto make_stats = [&]() {
-        return solve::Stats{
+        timing.hash = hash_timer.ElapsedDuration();
+        timing.match = match_timer.ElapsedDuration();
+        solve::Stats stats{
             hashed,
             source.scanned(),
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start),
+            search_timer.ElapsedDuration(),
+            timing,
         };
+        return stats;
     };
 
     while (true) {
@@ -655,31 +757,46 @@ solve::Outcome RunEngine(const solve::SearchProblem& problem, CandidateSource& s
             return outcome;
         }
 
-        const std::size_t count = source.next_batch(candidates);
+        std::size_t count = source.next_batch(candidates, timing.generate);
         if (count == 0) {
             break;
         }
-
-        for (std::size_t i = 0; i < count; ++i) {
-            inputs[i] = std::as_bytes(std::span{candidates[i].data(), candidates[i].size()});
+        {
+            [[maybe_unused]] const Timer::ScopedTimer phase(timing.generate.prepare,
+                                                            kTimingEnabled);
+            for (std::size_t i = 0; i < count; ++i) {
+                inputs[i] = std::as_bytes(std::span{candidates[i].data(), candidates[i].size()});
+            }
         }
-        hashlib::md5_batch(std::span<const std::span<const std::byte>>{inputs.data(), count},
-                           std::span<solve::Digest>{digests.data(), count});
+        {
+            [[maybe_unused]] const Timer::ScopedTimer phase(hash_timer, kTimingEnabled);
+            hashlib::md5_batch(std::span<const std::span<const std::byte>>{inputs.data(), count},
+                               std::span<solve::Digest>{digests.data(), count});
+        }
         hashed += count;
 
-        for (std::size_t i = 0; i < count; ++i) {
-            if (digests[i] != problem.target.digest) {
-                continue;
+        std::optional<std::size_t> found;
+        {
+            [[maybe_unused]] const Timer::ScopedTimer phase(match_timer, kTimingEnabled);
+            for (std::size_t i = 0; i < count; ++i) {
+                if (digests[i] != problem.target.digest) {
+                    continue;
+                }
+                // The source is supposed to enforce the anagram constraint already.
+                // Checking it again on a hit keeps a buggy source from returning a hash collision that is not an anagram.
+                if (problem.anagram &&
+                    !solve::IsAnagram(candidates[i], problem.anagram->letters)) {
+                    continue;
+                }
+                found = i;
+                break;
             }
-            // The source is supposed to enforce the anagram constraint already.
-            // Checking it again on a hit keeps a buggy source from returning a hash collision that is not an anagram.
-            if (problem.anagram && !solve::IsAnagram(candidates[i], problem.anagram->letters)) {
-                continue;
-            }
+        }
+        if (found) {
             solve::Outcome outcome;
             outcome.status = solve::Status::found;
             outcome.solution =
-                solve::Solution{candidates[i], digests[i], std::string(solver_id)};
+                solve::Solution{candidates[*found], digests[*found], std::string(solver_id)};
             outcome.stats = make_stats();
             return outcome;
         }
@@ -690,6 +807,54 @@ solve::Outcome RunEngine(const solve::SearchProblem& problem, CandidateSource& s
     outcome.stats = make_stats();
     outcome.message = "exhausted the search space after " + std::to_string(hashed) +
                       " hash(es) without a match";
+    return outcome;
+}
+
+// Shared body of both Solve overloads. `total_timer` starts here, so a caller
+// that planned itself can add its planning time to the result if it wants the
+// whole pipeline.
+solve::Outcome SolveWithPlan(const solve::SearchProblem& problem, const solve::Plan& plan) {
+    solve::Timing timing;
+    solve::Counters counters;
+    Timer::Timer setup_timer;
+    Timer::Timer total_timer(kTimingEnabled);
+
+    solve::Outcome outcome;
+    if (plan.solver == "permutations") {
+        PermutationSource source(problem.anagram->letters, setup_timer);
+        outcome = RunEngine(problem, source, "permutations", timing);
+    } else if (plan.solver == "phrase") {
+        PhraseSearch search(problem, problem.anagram->letters, setup_timer, timing, counters);
+        outcome = search.Run();
+    } else if (plan.solver == "dictionary") {
+        if (!problem.wordlist) {
+            outcome.status = solve::Status::invalid;
+            outcome.message = "solver 'dictionary' requires a wordlist (--wordlist)";
+        } else {
+            DictionarySource source(problem.wordlist->path, problem.anagram->letters,
+                                    setup_timer);
+            if (!source.is_open()) {
+                outcome.status = solve::Status::invalid;
+                outcome.message = source.error().empty()
+                                      ? "cannot open wordlist: " +
+                                            problem.wordlist->path.string()
+                                      : source.error();
+            } else {
+                outcome = RunEngine(problem, source, "dictionary", timing);
+            }
+        }
+    } else {
+        // A Plan normally comes from PlanSearch; tolerate a hand-built one.
+        outcome.status = solve::Status::invalid;
+        outcome.message = "unknown solver '" + std::string(plan.solver) + "'";
+    }
+
+    // RunEngine / PhraseSearch filled generate/hash/match; add the phases that
+    // wrap them here.
+    timing.setup = setup_timer.ElapsedDuration();
+    timing.total = total_timer.ElapsedDuration();
+    outcome.stats.timing = timing;
+    outcome.stats.counters = counters;
     return outcome;
 }
 
@@ -933,7 +1098,9 @@ std::optional<Plan> PlanSearch(const SearchProblem& problem, std::string_view re
 
 Outcome Solve(const SearchProblem& problem, std::string_view requested) {
     std::string error;
+    Timer::Timer planning_timer(kTimingEnabled);
     const std::optional<Plan> plan = PlanSearch(problem, requested, error);
+    planning_timer.Stop();
     if (!plan) {
         Outcome outcome;
         outcome.status = Status::invalid;
@@ -941,40 +1108,23 @@ Outcome Solve(const SearchProblem& problem, std::string_view requested) {
         return outcome;
     }
 
+    Outcome outcome = SolveWithPlan(problem, *plan);
+    // SolveWithPlan measured setup and the search; fold in the planning that
+    // happened just above so `total` covers the whole call.
+    const std::chrono::nanoseconds planning = planning_timer.ElapsedDuration();
+    outcome.stats.timing.planning = planning;
+    outcome.stats.timing.total += planning;
+    return outcome;
+}
+
+Outcome Solve(const SearchProblem& problem, const Plan& plan) {
     if (!problem.anagram) {
         Outcome outcome;
         outcome.status = Status::invalid;
         outcome.message = "solving requires an anagram (--anagram-of)";
         return outcome;
     }
-
-    if (plan->solver == "permutations") {
-        PermutationSource source(problem.anagram->letters);
-        return RunEngine(problem, source, "permutations");
-    }
-
-    if (plan->solver == "phrase") {
-        PhraseSearch search(problem, problem.anagram->letters);
-        return search.Run();
-    }
-
-    if (!problem.wordlist) {
-        Outcome outcome;
-        outcome.status = Status::invalid;
-        outcome.message = "solver 'dictionary' requires a wordlist (--wordlist)";
-        return outcome;
-    }
-
-    DictionarySource source(problem.wordlist->path, problem.anagram->letters);
-    if (!source.is_open()) {
-        Outcome outcome;
-        outcome.status = Status::invalid;
-        outcome.message = source.error().empty()
-                              ? "cannot open wordlist: " + problem.wordlist->path.string()
-                              : source.error();
-        return outcome;
-    }
-    return RunEngine(problem, source, "dictionary");
+    return SolveWithPlan(problem, plan);
 }
 
 }  // namespace solve

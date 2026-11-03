@@ -37,6 +37,10 @@ modern-cmake-app-template/
 │   │       ├── kernel_sse2.cpp             # module hashlib.batch; 4 lanes
 │   │       ├── kernel_avx2.cpp             # module hashlib.batch; 8 lanes
 │   │       └── kernel_avx512.cpp           # module hashlib.batch; 16 lanes
+│   ├── TimerLib/
+│   │   ├── CMakeLists.txt
+│   │   ├── Timer.cpp                       # module Timer; (stopwatch + duration formatting)
+│   │   └── Timer.cppm                      # export module Timer; (Timer + ScopedTimer)
 │   └── SolveLib/
 │       ├── CMakeLists.txt
 │       ├── solve.cpp                       # permutation/dictionary/phrase sources + batch engine
@@ -171,6 +175,16 @@ found and 1 when the space is exhausted. `--explain` prints the chosen solver
 and its cost estimate before searching, `--dry-run` stops there,
 `--max-candidates` bounds hashed candidates, and the phrase solver also stops
 at its internal prefix budget.
+
+Debug and RelWithDebInfo builds also log a per-phase timing breakdown after a
+solve: planning, wordlist setup/indexing, candidate generation (split into the
+solver-specific `permute`, `scan`, `filter` and `dfs` sub-phases, plus
+`prepare`), `md5_batch`, digest comparison, and the solve and pipeline totals.
+The phrase solver additionally splits `dfs` by phrase length and reports work
+counters (`Fits` calls/passes, edges, leaf visits/candidates, same-count hits,
+phrases emitted). The instrumentation is compiled out in Release, so its search
+loop is unchanged; the `Timer` module it uses lives in `TimerLib` and is shared
+with the CLI benchmarks.
 
 ## Prerequisites
 

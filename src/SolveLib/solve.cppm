@@ -50,12 +50,87 @@ enum class Status {
     invalid,
 };
 
+/// Longest phrase, in words, that the phrase solver composes.
+inline constexpr std::size_t kMaxPhraseWords = 8;
+
+/// Per-phase wall-clock cost of one solve.
+///
+/// The fields exist in every configuration so `Stats` keeps one layout, but the
+/// clock is only read when the build defines `SOLVE_TIMING` (Debug and
+/// RelWithDebInfo, see src/SolveLib/CMakeLists.txt). Release compiles every
+/// measurement out and leaves these at zero, so the search loop is unchanged.
+struct Timing {
+    /// The solver-specific work behind `generate`. One solver fills one of
+    /// `permute`/`scan`+`filter`/`dfs`; `prepare` is common to all of them.
+    struct Generate {
+        /// Permutations solver: `next_permutation` plus emitting the candidate.
+        std::chrono::nanoseconds permute{0};
+        /// Dictionary solver: reading and tokenizing the wordlist.
+        std::chrono::nanoseconds scan{0};
+        /// Dictionary solver: the length/multiset check and emitting accepted
+        /// tokens.
+        std::chrono::nanoseconds filter{0};
+        /// Phrase solver: depth-first composition of candidate phrases.
+        std::chrono::nanoseconds dfs{0};
+        /// Phrase solver: `dfs` split by phrase length. Index 0 is a two-word
+        /// phrase, index `kMaxPhraseWords - 2` is `kMaxPhraseWords` words.
+        std::array<std::chrono::nanoseconds, kMaxPhraseWords - 1> dfs_by_word_count{};
+        /// Filling the span array handed to `hashlib::md5_batch`.
+        std::chrono::nanoseconds prepare{0};
+
+        [[nodiscard]] std::chrono::nanoseconds total() const noexcept {
+            return permute + scan + filter + dfs + prepare;
+        }
+    };
+
+    /// Choosing the strategy, including counting wordlist entries for `auto`.
+    std::chrono::nanoseconds planning{0};
+    /// Building the candidate source: sorting the permutation seed, or opening,
+    /// reading and indexing the wordlist for the phrase solver.
+    std::chrono::nanoseconds setup{0};
+    /// Producing candidates, broken down by what the selected solver spends its
+    /// time on.
+    Generate generate{};
+    /// Time inside `hashlib::md5_batch`.
+    std::chrono::nanoseconds hash{0};
+    /// Comparing candidate digests against the target.
+    std::chrono::nanoseconds match{0};
+    /// Wall-clock time of the whole `Solve` call. When the caller supplies a
+    /// `Plan`, the planning that produced it happened before this call.
+    std::chrono::nanoseconds total{0};
+};
+
+/// Work counters for the phrase solver's depth-first search. Counting is a
+/// single increment per event (no clock reads), but like `Timing` it is only
+/// recorded when `SOLVE_TIMING` is enabled; Release leaves these at zero.
+struct Counters {
+    /// Words examined by an internal node's loop (one `Fits` call each).
+    std::uint64_t fits_calls = 0;
+    /// `Fits` returned true and the word passed the letter-count check.
+    std::uint64_t fits_passes = 0;
+    /// Recursive DFS calls made after pruning.
+    std::uint64_t edges = 0;
+    /// Entries into the `words_left == 1` leaf branch.
+    std::uint64_t leaf_visits = 0;
+    /// Bucket entries examined at a leaf.
+    std::uint64_t leaf_candidates = 0;
+    /// Leaf entries whose letter counts matched exactly.
+    std::uint64_t same_counts_hits = 0;
+    /// Complete phrases handed to the hash batch.
+    std::uint64_t phrases_emitted = 0;
+};
+
 struct Stats {
     /// Candidates that were actually hashed.
     std::uint64_t candidates = 0;
     /// Permutations generated, or wordlist entries read (whichever the solver does).
     std::uint64_t scanned = 0;
+    /// Duration of the search loop (excluding planning and setup).
     std::chrono::nanoseconds elapsed{0};
+    /// Per-phase breakdown. Zero in Release builds, where it is not measured.
+    Timing timing{};
+    /// Phrase-solver work counters. Zero in Release builds.
+    Counters counters{};
 };
 
 struct Solution {
@@ -102,6 +177,13 @@ std::optional<Plan> PlanSearch(const SearchProblem& problem, std::string_view re
 
 /// Runs the selected strategy. `requested` is "auto" or a solver id.
 Outcome Solve(const SearchProblem& problem, std::string_view requested = "auto");
+
+/// Runs a strategy chosen by PlanSearch.
+///
+/// Passing the plan back avoids scanning the wordlist a second time (PlanSearch
+/// counts entries before the search starts). The plan must describe this
+/// problem; `Solve(problem, requested)` is the all-in-one form.
+Outcome Solve(const SearchProblem& problem, const Plan& plan);
 
 /// Parses exactly 32 hexadecimal characters (either case).
 std::optional<Digest> ParseDigest(std::string_view hex);

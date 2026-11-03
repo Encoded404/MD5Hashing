@@ -61,6 +61,10 @@ std::int64_t Timer::ElapsedNsInt() const noexcept {
     return ElapsedRaw();
 }
 
+std::chrono::nanoseconds Timer::ElapsedDuration() const noexcept {
+    return std::chrono::nanoseconds{ElapsedRaw()};
+}
+
 bool Timer::IsRunning() const noexcept {
     return running_;
 }

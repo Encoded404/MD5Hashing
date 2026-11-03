@@ -290,7 +290,7 @@ void BenchmarkBatch(std::span<const std::byte> input, int iterations, int batchS
     std::string line = "md5_batch (" + std::string(info.isa) + ", " +
                        std::to_string(info.lanes) + " lane(s)): " + std::to_string(iterations) +
                        " call(s) x " + std::to_string(batchSize) + " hash(es) in " +
-                       Timer::FormatDuration(std::chrono::nanoseconds{timer.ElapsedNsInt()}) +
+                       Timer::FormatDuration(timer.ElapsedDuration()) +
                        ", " +
                        ToFixed(nanosecondsPerCall, 1) + " ns/call, " +
                        ToFixed(nanosecondsPerHash, 1) + " ns/hash";
@@ -343,7 +343,7 @@ void Benchmark(std::span<const std::byte> input, const std::vector<const Algorit
             timer.ElapsedNs() / static_cast<double>(iterations);
         std::string line = "md5 (" + std::string(algorithm->name) + "): " +
                            std::to_string(iterations) + " call(s) in " +
-                           Timer::FormatDuration(std::chrono::nanoseconds{timer.ElapsedNsInt()}) +
+                           Timer::FormatDuration(timer.ElapsedDuration()) +
                            ", " + ToFixed(nanosecondsPerCall, 1) + " ns/call";
         if (!input.empty()) {
             // bytes per nanosecond is GB/s
@@ -430,6 +430,62 @@ std::optional<hashlib::Digest> ResolveTarget(const SolveOptions& options, std::s
     return std::nullopt;
 }
 
+#if defined(SOLVE_TIMING) && SOLVE_TIMING
+// Only compiled in Debug and RelWithDebInfo (see src/SolveLib/CMakeLists.txt).
+// The solve pipeline is split into the phases that decide where the time goes:
+// planning vs wordlist setup, candidate generation, MD5, and digest comparison.
+void LogSolveTiming(std::chrono::nanoseconds planning, const solve::Timing& timing,
+                    const solve::Counters& counters) {
+    using Timer::FormatDuration;
+
+    std::string message = "solve timing (Debug/RelWithDebInfo instrumentation)";
+    message += "\n  planning       " + FormatDuration(planning);
+    message += "\n  setup/index    " + FormatDuration(timing.setup);
+    message += "\n  generate       " + FormatDuration(timing.generate.total());
+    if (timing.generate.permute.count() > 0) {
+        message += "\n    permute      " + FormatDuration(timing.generate.permute);
+    }
+    if (timing.generate.scan.count() > 0) {
+        message += "\n    scan         " + FormatDuration(timing.generate.scan);
+    }
+    if (timing.generate.filter.count() > 0) {
+        message += "\n    filter       " + FormatDuration(timing.generate.filter);
+    }
+    if (timing.generate.dfs.count() > 0) {
+        message += "\n    dfs          " + FormatDuration(timing.generate.dfs);
+    }
+    for (std::size_t i = 0; i < timing.generate.dfs_by_word_count.size(); ++i) {
+        const std::chrono::nanoseconds duration = timing.generate.dfs_by_word_count[i];
+        if (duration.count() > 0) {
+            message += "\n      words" + std::to_string(i + 2) + "     " +
+                       FormatDuration(duration);
+        }
+    }
+    if (timing.generate.prepare.count() > 0) {
+        message += "\n    prepare      " + FormatDuration(timing.generate.prepare);
+    }
+    message += "\n  hash           " + FormatDuration(timing.hash);
+    message += "\n  match          " + FormatDuration(timing.match);
+    message += "\n  solve total    " + FormatDuration(timing.total);
+    message += "\n  pipeline total " + FormatDuration(planning + timing.total);
+
+    if (counters.fits_calls > 0) {
+        const double pass_rate = 100.0 * static_cast<double>(counters.fits_passes) /
+                                 static_cast<double>(counters.fits_calls);
+        message += "\n  counters";
+        message += "\n    fits calls    " + std::to_string(counters.fits_calls) + " (" +
+                   ToFixed(pass_rate, 1) + "% pass)";
+        message += "\n    fits passes   " + std::to_string(counters.fits_passes);
+        message += "\n    edges         " + std::to_string(counters.edges);
+        message += "\n    leaf visits   " + std::to_string(counters.leaf_visits);
+        message += "\n    leaf entries  " + std::to_string(counters.leaf_candidates);
+        message += "\n    same counts   " + std::to_string(counters.same_counts_hits);
+        message += "\n    phrases       " + std::to_string(counters.phrases_emitted);
+    }
+    LOGIFACE_LOG(info, message);
+}
+#endif
+
 int RunSolve(const SolveOptions& options, CLI::App& app) {
     if (options.list_solvers) {
         for (const solve::SolverInfo& info : solve::Solvers()) {
@@ -454,7 +510,13 @@ int RunSolve(const SolveOptions& options, CLI::App& app) {
     }
     problem.max_candidates = options.max_candidates;
 
+#if defined(SOLVE_TIMING) && SOLVE_TIMING
+    Timer::Timer planning_timer(true);
+#endif
     const std::optional<solve::Plan> plan = solve::PlanSearch(problem, options.solver, error);
+#if defined(SOLVE_TIMING) && SOLVE_TIMING
+    const std::chrono::nanoseconds planning = planning_timer.ElapsedDuration();
+#endif
     if (!plan) {
         return app.exit(CLI::ValidationError("solve", error));
     }
@@ -478,7 +540,13 @@ int RunSolve(const SolveOptions& options, CLI::App& app) {
     }
 
     LOGIFACE_LOG(info, "searching with the " + std::string(plan->solver) + " solver");
-    const solve::Outcome outcome = solve::Solve(problem, options.solver);
+    const solve::Outcome outcome = solve::Solve(problem, *plan);
+
+#if defined(SOLVE_TIMING) && SOLVE_TIMING
+    if (outcome.status != solve::Status::invalid) {
+        LogSolveTiming(planning, outcome.stats.timing, outcome.stats.counters);
+    }
+#endif
 
     switch (outcome.status) {
         case solve::Status::found:

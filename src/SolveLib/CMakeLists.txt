@@ -2,7 +2,18 @@
 # MD5 path but knows nothing about the CLI; the app is a thin adapter.
 add_library(${SOLVE_LIBRARY_TARGET} STATIC)
 target_compile_features(${SOLVE_LIBRARY_TARGET} PUBLIC cxx_std_26)
-target_link_libraries(${SOLVE_LIBRARY_TARGET} PUBLIC ${HASH_LIBRARY_TARGET})
+target_link_libraries(${SOLVE_LIBRARY_TARGET}
+    PUBLIC ${HASH_LIBRARY_TARGET}
+    PRIVATE ${TIMER_LIBRARY_TARGET}
+)
+
+# Per-phase solve timing is a diagnostic: it reads the clock once per phase and
+# keeps a handful of counters. Compile it in only for Debug and RelWithDebInfo;
+# Release runs the same search loop as an uninstrumented build. PUBLIC so the
+# CLI, which formats the report, sees the same setting.
+target_compile_definitions(${SOLVE_LIBRARY_TARGET} PUBLIC
+    "$<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:SOLVE_TIMING=1>"
+)
 
 target_compile_options(${SOLVE_LIBRARY_TARGET} PRIVATE
     $<$<CXX_COMPILER_ID:GNU>:-Wall -Werror>
