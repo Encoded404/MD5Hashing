@@ -26,7 +26,11 @@ using Digest = std::array<std::byte, 16>;
 /// the function is `noexcept`; only the trailing one or two blocks go through a 128-byte stack buffer.
 /// All 64 steps are expanded at compile time, so the round constant, the rotation amount and the message index are constants,
 /// and the state is passed by value so it stays in registers for the whole message.
-/// Roughly 3x the throughput of `naive_md5`. see `docs/md5-optimization.md` for the measurements behind each choice.
+///
+/// The speed-up over `naive_md5` depends on the compiler,
+/// because `naive_md5`'s rolled loop is exactly the shape that compilers optimise very differently.
+/// roughly 1.3-1.5x with Clang, and up to ~3.5x with GCC (whose code for the rolled loop is far worse).
+/// `docs/md5-optimization.md` has the measurements behind each choice.
 ///
 /// Not a streaming API.
 [[nodiscard]] Digest md5_fast(std::span<const std::byte> input) noexcept;
