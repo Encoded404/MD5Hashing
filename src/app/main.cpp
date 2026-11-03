@@ -284,7 +284,7 @@ void Benchmark(std::span<const std::byte> input, const std::vector<const Algorit
             line += ", " + ToFixed(static_cast<double>(input.size()) / nanosecondsPerCall, 2) +
                     " GB/s";
         }
-        LOGIFACE_LOG(info, line);
+        std::cout << line << '\n';
     }
 
     const auto* logger = Logiface::GetLogger();
