@@ -331,6 +331,13 @@ endif()
 
 option(ENABLE_LOGGING "Enable header-only logging interface" ON)
 
+# Tuning for the MD5 core only. Hashing is a serial dependency chain, so its speed
+# is unusually sensitive to how the compiler schedules it, and the best -mtune is
+# compiler-dependent (see docs/md5-optimization.md). Kept opt-in: -march=native
+# makes the binaries non-portable, and it is meaningless when cross-compiling.
+option(HASHLIB_NATIVE_TUNING
+	"Tune the MD5 hash core for the build machine (-march=native -mtune=generic)" OFF)
+
 option(CLANG_TIDY_ENABLED "Enable Clang-Tidy static analysis" ON)
 # disable Clang-Tidy if not using Clang or GCC
 if(CLANG_TIDY_ENABLED AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

@@ -21,6 +21,18 @@ if(CMAKE_CONFIGURATION_TYPES)
     )
 endif()
 
+# Optional per-machine tuning for the hash core only (HASHLIB_NATIVE_TUNING).
+# The kernel is a serial dependency chain, so it is unusually sensitive to the
+# scheduler; -mtune=generic is pinned because the native tuning models measured
+# worse for this loop on GCC. Skipped when cross-compiling, where -march=native
+# would describe the build host rather than the target.
+if(HASHLIB_NATIVE_TUNING AND NOT CMAKE_CROSSCOMPILING)
+    target_compile_options(${HASH_LIBRARY_TARGET} PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-march=native>
+        $<$<CXX_COMPILER_ID:GNU,Clang>:-mtune=generic>
+    )
+endif()
+
 # Module files.
 # PUBLIC so consumers (the app, the tests) can `import hashlib;` and
 # `import hashlib.utilities;`.

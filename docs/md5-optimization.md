@@ -43,13 +43,23 @@ the constant tables hoisted.
 
 `naive_md5` declares `K` inside the per-block loop and `s` inside the 64-step
 loop. Both are local `constexpr` arrays; each execution of the declaration
-initialises an automatic object, and GCC 15 materialises a stack copy because
-the index is a runtime value. `K` costs 256 bytes once per block, `s` costs 256
-bytes 64 times per block: about 16 KiB of stores per 64-byte block.
+initialises an automatic object, and GCC 15 materialises a copy of the tables
+because the index is a runtime value. For a standalone GCC 15.3.1 build of the
+same function that is 12 vector loads out of `.rodata` and 36 vector stores
+(1.1 KiB), once per 64-byte block: a per-block cost, not a per-step one.
 
 Hoisting both tables to namespace scope accounts for most of the gap between
 `naive_md5` and `md5_fast`: 0.34 to 0.87 GB/s with GCC `-mtune=generic` (0.92
-with `-march=native`), and 206 to 76 ns at 55 bytes.
+with `-march=native`), and 206 to 76 ns at 55 bytes. Hoisting changes more than
+the table access: with the arrays at namespace scope GCC unrolls and
+phase-splits the 64-step loop (582 instructions, 17 rotate instructions)
+instead of leaving it rolled with a copy of the tables (501 instructions, 2
+rotates). Most of the gain comes from that loop restructuring, not from the
+copy on its own.
+
+Clang does not copy the tables: it keeps both in `.rodata` (512 bytes) and
+indexes it directly. That is a large part of why `naive_md5` is much faster
+under Clang, and why the speed-up from `md5_fast` is smaller there.
 
 ### The branch chain
 

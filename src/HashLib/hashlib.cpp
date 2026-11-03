@@ -205,6 +205,26 @@ namespace {
         std::memcpy(bytes, &value, sizeof(value));
     }
 
+    // Identity, plus an optimisation barrier: the value is forced into a register
+    // instead of being folded into the expression that produced it.
+    //
+    // MD5's cost is its round-to-round latency, and the optimiser is free to reassociate `target + (k + X[g]) + f`.
+    // LLVM does exactly that: it moves the constant behind `f`,
+    // where it becomes one more dependent operation on the chain that ends in the rotate.
+    // Pinning the sum first keeps the constant and the message word off that chain.
+    // The barrier emits no instructions; it only constrains the optimiser.
+    // 181 -> 151 ns per 64 KiB (6.0 -> 5.1 cycles/byte) with the shipped Clang build.
+    // See docs/md5-optimization.md.
+    //
+    // Compilers with no inline-asm barrier get the value unchanged: correct, just
+    // without the scheduling hint.
+    [[nodiscard]] HASHLIB_ALWAYS_INLINE std::uint32_t Pin(std::uint32_t value) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+        asm volatile("" : "+r"(value));
+#endif
+        return value;
+    }
+
     // One MD5 step. The four state words rotate through the (target, x, y, z) roles with I % 4, which is what makes the 64 steps a straight-line sequence.
     // step I writes the slot that step I - 1 read as x, so no register shuffling is needed.
     template <std::size_t I>
@@ -243,9 +263,15 @@ namespace {
             f = y ^ (x | ~z);
         }
 
-        target += f + k + LoadLe32(block + 4 * g);
-        target = std::rotl(target, shift);
-        target += x;
+        // k + X[g] is combined first and pinned, so the optimiser cannot move the
+        // constant behind f and add a dependent op to the rotate's chain.
+        // this is what it does in normal code:
+        //        target += f + k + LoadLe32(block + 4 * g);
+        //        target = std::rotl(target, shift);
+        //        target += x;
+
+        const std::uint32_t message = Pin(k + LoadLe32(block + 4 * g));
+        target = std::rotl((target + message) + f, shift) + x;
     }
 
     // A function template rather than a generic lambda: GCC declines to inline a 600-instruction closure,
@@ -290,7 +316,11 @@ Digest md5_fast(std::span<const std::byte> input) noexcept {
     const std::size_t remainder = input.size() - blockCount * kBlockBytes;
 
     // Full blocks are hashed straight out of the caller's buffer: no copy.
-    State state = Compress(State{}, input.data(), blockCount);
+    // Compress is out of line, so skip the call entirely for sub-block messages.
+    State state;
+    if (blockCount != 0) {
+        state = Compress(State{}, input.data(), blockCount);
+    }
 
     // Only the trailing one or two blocks go through a zeroed stack buffer.
     std::byte tail[2 * kBlockBytes] = {};
