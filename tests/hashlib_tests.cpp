@@ -111,17 +111,38 @@ TEST(HashLibTest, Md5HandlesMoreThan64KBlocks) {
 // The implementations must agree for every length, including the lengths where
 // the padded tail needs an extra block. This is the property that lets the CLI
 // run several of them by default and compare the results.
+//
+// The fill is position-dependent on purpose.
+// a single repeated character makes every 32-bit message word identical, which hides a wrong message-word index.
 TEST(HashLibTest, Md5ImplementationsAgree) {
-    for (std::size_t length = 0; length <= 200; ++length) {
+    const auto checkLength = [](std::size_t length) {
         SCOPED_TRACE(std::to_string(length));
-        const std::string input(length, static_cast<char>('a' + length % 26));
+        std::string input(length, '\0');
+        for (std::size_t i = 0; i < length; ++i) {
+            input[i] = static_cast<char>(i * 37 + 11);
+        }
 
-        const hashlib::Digest reference = hashlib::naive_md5(
-            std::as_bytes(std::span{input.data(), input.size()}));
+        const std::span<const std::byte> bytes = std::as_bytes(std::span{input.data(), input.size()});
+        const hashlib::Digest reference = hashlib::naive_md5(bytes);
         for (const auto& [name, function] : kImplementations) {
             SCOPED_TRACE(std::string(name));
-            EXPECT_EQ(function(std::as_bytes(std::span{input.data(), input.size()})), reference);
+            EXPECT_EQ(function(bytes), reference);
         }
+    };
+
+    for (std::size_t length = 0; length <= 200; ++length) {
+        checkLength(length);
+    }
+
+    // Block and tail boundaries beyond the sweep above, plus a few multi-block sizes.
+    constexpr std::array kBoundaryLengths{
+        std::size_t{255},  std::size_t{256},  std::size_t{511},  std::size_t{512},
+        std::size_t{513},  std::size_t{1000}, std::size_t{1023}, std::size_t{1024},
+        std::size_t{4095}, std::size_t{4096}, std::size_t{4097}, std::size_t{65535},
+        std::size_t{65536}, std::size_t{65537},
+    };
+    for (const std::size_t length : kBoundaryLengths) {
+        checkLength(length);
     }
 }
 
