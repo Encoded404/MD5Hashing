@@ -49,6 +49,21 @@ gtest_discover_tests(hashlib_tests
         ENVIRONMENT "TEST_LOG_DIR=${CMAKE_BINARY_DIR}/Testing/logs"
 )
 
+# The batch dispatcher selects the widest kernel the CPU supports and caches it,
+# so the run above only ever executes one compiled kernel. Run the batch tests
+# once per kernel through the dispatcher's own HASHLIB_FORCE_ISA hook. When the
+# named kernel is unavailable on this CPU the dispatcher falls back to the
+# scalar path, and Md5BatchUsesForcedKernel then reports SKIPPED instead of
+# passing without exercising anything.
+if(HASHLIB_SIMD)
+    foreach(isa IN ITEMS sse2 avx2 avx512f scalar)
+        add_test(NAME hashlib_tests_batch_${isa}
+                 COMMAND $<TARGET_FILE:hashlib_tests> --gtest_filter=HashLibTest.Md5Batch*)
+        set_tests_properties(hashlib_tests_batch_${isa} PROPERTIES
+            ENVIRONMENT "HASHLIB_FORCE_ISA=${isa};TEST_LOG_DIR=${CMAKE_BINARY_DIR}/Testing/logs")
+    endforeach()
+endif()
+
 # Same debug-info compression and gc-sections as the shipped binaries. Test
 # executables are deliberately not stripped, so a failing test is always
 # symbolizable.

@@ -243,3 +243,47 @@ TEST(HashLibTest, Md5BatchHandlesEmptyBatch) {
     hashlib::md5_batch(inputs, digests);
     EXPECT_TRUE(digests.empty());
 }
+
+// The runtime picks the widest kernel the CPU supports, so an ordinary run only
+// ever executes one of the compiled kernels. HASHLIB_FORCE_ISA selects one
+// explicitly, and tests/CMakeLists.txt registers a CTest entry per kernel so all
+// of them run on a machine that supports them. This test makes the selection
+// visible: it skips (rather than passing silently) when the requested kernel is
+// not available, which is what happens on an older CPU or a non-x86 build.
+TEST(HashLibTest, Md5BatchUsesForcedKernel) {
+    const char* forced = std::getenv("HASHLIB_FORCE_ISA");
+    if (forced == nullptr || *forced == '\0') {
+        GTEST_SKIP() << "HASHLIB_FORCE_ISA not set";
+    }
+
+    const std::string requested{forced};
+    const hashlib::BatchInfo info = hashlib::md5_batch_info();
+    if (info.isa != requested) {
+        GTEST_SKIP() << "kernel '" << requested << "' is not available on this CPU; the "
+                     << "dispatcher selected '" << info.isa << "'";
+    }
+
+    // Hash a batch of differing lengths with the forced kernel and check it
+    // against the single-message path, so the forced kernel is exercised rather
+    // than only reported.
+    constexpr std::size_t kBatchSize = 16;
+    std::vector<std::string> messages;
+    messages.reserve(kBatchSize);
+    for (std::size_t i = 0; i < kBatchSize; ++i) {
+        messages.emplace_back(1 + i * 13, static_cast<char>('a' + i));
+    }
+
+    std::vector<std::span<const std::byte>> inputs;
+    inputs.reserve(kBatchSize);
+    for (const std::string& message : messages) {
+        inputs.emplace_back(std::as_bytes(std::span{message.data(), message.size()}));
+    }
+
+    std::vector<hashlib::Digest> digests(inputs.size());
+    hashlib::md5_batch(inputs, digests);
+
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        SCOPED_TRACE("index " + std::to_string(i));
+        EXPECT_EQ(digests[i], hashlib::md5_fast(inputs[i]));
+    }
+}
