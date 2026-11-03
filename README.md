@@ -68,7 +68,7 @@ input, so the choice is purely about the shape of the workload:
 | function | allocation | notes |
 |---|---|---|
 | `hashlib::naive_md5` | yes (`std::vector`) | follows the Wikipedia pseudocode closely; intended for learning and benchmarking |
-| `hashlib::md5_fast` | none, `noexcept` | single message; 64-byte blocks hashed in place, 64 steps expanded at compile time, state kept in registers; ~3x the throughput of `naive_md5` as currently written (see `docs/md5-optimization.md` for why the naive one is that slow) |
+| `hashlib::md5_fast` | none, `noexcept` | single message; 64-byte blocks hashed in place, 64 steps expanded at compile time, state kept in registers; 1.3-1.5x the throughput of `naive_md5` with Clang and up to ~3.5x with GCC, because the naive loop is the shape compilers disagree about most (see `docs/md5-optimization.md`) |
 | `hashlib::md5_batch` | none, `noexcept` | many independent messages at once, hashed `lanes` at a time with SSE2, AVX2 or AVX-512F selected at runtime |
 
 MD5 cannot be parallelised *inside* one message: the 64 steps and the block
@@ -147,7 +147,7 @@ Options:
 - `-DUSE_LIBCPP=ON` to build against libc++ instead of libstdc++ (Clang only; configuration fails if libc++ is unavailable)
 - `-DENABLE_SANITIZERS=OFF` to skip the Debug ASan/UBSan build (default: ON, and forced OFF on Windows/MinGW)
 - `-DHASHLIB_SIMD=OFF` to build a scalar-only library instead of the runtime-dispatched SSE2/AVX2/AVX-512 batch kernels (default: ON)
-- `-DHASHLIB_NATIVE_TUNING=ON` to tune the library for the build machine (OFF by default; mutually exclusive with `HASHLIB_SIMD`, because `-march=native` would make the dispatcher itself non-portable)
+- `-DHASHLIB_NATIVE_TUNING=ON` to build HashLib and everything that imports it with `-march=native -mtune=generic`, worth about 5% on `md5_fast` (OFF by default; mutually exclusive with `HASHLIB_SIMD`, because `-march=native` would make the dispatcher itself non-portable)
 
 C++26 and `import std;` are mandatory; there is no header-based configuration to fall back to.
 

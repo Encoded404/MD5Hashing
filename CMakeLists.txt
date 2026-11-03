@@ -331,12 +331,13 @@ endif()
 
 option(ENABLE_LOGGING "Enable header-only logging interface" ON)
 
-# Tuning for the MD5 core only. Hashing is a serial dependency chain, so its speed
-# is unusually sensitive to how the compiler schedules it, and the best -mtune is
-# compiler-dependent (see docs/md5-optimization.md). Kept opt-in: -march=native
-# makes the binaries non-portable, and it is meaningless when cross-compiling.
+# Tuning for the MD5 hash core. Hashing is a serial dependency chain, so its speed
+# is unusually sensitive to how the compiler schedules it and to which ISA the
+# compiler can use (see docs/md5-optimization.md). Kept opt-in: -march=native
+# makes every binary that links HashLib non-portable, and it is meaningless when
+# cross-compiling. Applies to the library and to everything that imports it.
 option(HASHLIB_NATIVE_TUNING
-	"Tune the MD5 hash core for the build machine (-march=native -mtune=generic)" OFF)
+	"Build HashLib and its consumers for the build machine (-march=native -mtune=generic)" OFF)
 
 # Runtime-dispatched batched MD5 kernels (SSE2 / AVX2 / AVX-512F) behind
 # `hashlib::md5_batch`. These are compiled per architecture and selected on the

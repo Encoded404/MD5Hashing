@@ -213,11 +213,21 @@ namespace {
     // where it becomes one more dependent operation on the chain that ends in the rotate.
     // Pinning the sum first keeps the constant and the message word off that chain.
     // The barrier emits no instructions; it only constrains the optimiser.
-    // 181 -> 151 ns per 64 KiB (6.0 -> 5.1 cycles/byte) with the shipped Clang build.
+    // 5.98 -> 4.98 cycles per byte on the shipped Clang build (0.92 -> 1.11 GB/s
+    // for a 1 MiB message, at 5.5 GHz). Every -march=native configuration lands
+    // on the same 4.75 cycles per step afterwards, whichever compiler and
+    // -mtune it is built with.
     // See docs/md5-optimization.md.
     //
     // Compilers with no inline-asm barrier get the value unchanged: correct, just
     // without the scheduling hint.
+    //
+    // Because the barrier is volatile, this function is no longer a pure
+    // expression to the optimiser. That is right for real inputs, but it also
+    // means a call in a loop that hashes one invariant buffer is no longer
+    // hoisted out, while the older non-volatile version was. A benchmark that
+    // compares the two, or that just wants to measure the hash, therefore needs
+    // an opaque function pointer or input that varies per iteration.
     [[nodiscard]] HASHLIB_ALWAYS_INLINE std::uint32_t Pin(std::uint32_t value) noexcept {
 #if defined(__GNUC__) || defined(__clang__)
         asm volatile("" : "+r"(value));

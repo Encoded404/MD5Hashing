@@ -37,6 +37,11 @@ OpenSSL (57.4 ns); Clang is 60.7 ns. `md5_fast` is about 3.5x the shipped `naive
 The as-shipped row is `naive_md5` itself; the second row is the same loop with
 the constant tables hoisted.
 
+These rows predate the `Pin` barrier described under "GCC vs Clang". With it the
+last row is 1.17 / 1.16 / 1.16 and the compiler columns stop differing, so read
+the spread above as the history of what the source looked like at each step, not
+as a property of the current implementation.
+
 ## Where the time went
 
 ### Constant tables inside the loops
@@ -219,6 +224,29 @@ because this CPU has no AVX-512. `HASHLIB_FORCE_ISA=sse2|avx2|avx512f|scalar`
 exercises each available kernel on one machine; Intel SDE or a Zen 4/5 runner
 is needed to execute the AVX-512 path.
 
+Re-measured on the Zen 5 machine (AVX-512), `HashApp -b --benchmark-batch 16`,
+`md5_batch` against `md5_fast` on the same build:
+
+| message | `md5_fast` GB/s | `md5_batch` GB/s | speed-up |
+|---|---|---|---|
+| 43 B | 0.70 | 3.58 | 5.1x |
+| 1 KiB | 0.99 | 6.64 | 6.7x |
+| 4 KiB | 1.09 | 7.02 | 6.4x |
+| 64 KiB | 1.10 | 7.16 | 6.5x |
+| 100 KB | 1.10 | 7.31 | 6.6x |
+
+Forced kernels at 4 KiB show the scaling is linear in lanes, so the kernel is
+not the limit: sse2 (4 lanes) 1.54, avx2 (8 lanes) 3.60, avx512f (16 lanes) 7.02,
+scalar (1 lane) 1.07 GB/s.
+
+A step is `vpternlogd`, `vpaddd`, `vprold`, `vpaddd`, and Zen 5 vector ALU
+operations measure 2 cycles each (the GPR `add`/`rol` path is 1), so one step is
+8 cycles and one block of 16 messages is 512 cycles: a bound of 2 bytes per
+cycle, or 11 GB/s at 5.5 GHz. 7.02 GB/s is 1.27 bytes per cycle, about 64% of
+that. The missing third is the per-block transpose and the per-lane pointer and
+digest bookkeeping in `hash_many.cpp`, both of which scale with lanes and blocks
+rather than with bytes.
+
 ## Compiler flags
 
 `-march=native` implies `-mtune=znver5` on GCC, and GCC's znver5 model produces
@@ -233,7 +261,26 @@ generic.
 -mtune=generic`, mostly through tuning.
 
 If `-march=native` is used in this project, pin `-mtune=generic` for the hash
-target and re-measure after compiler upgrades.
+target and re-measure after compiler upgrades. Note that this section is
+historical for `md5_fast`: the `Pin` barrier described under "GCC vs Clang"
+removed the tuning sensitivity, and every compiler now lands on the same
+schedule. It still applies to `naive_md5` and to code that has not adopted the
+barrier.
+
+The `HASHLIB_NATIVE_TUNING` CMake option is the supported way to use it. It
+still buys about 5% on the single-message path — 1.10 GB/s to 1.15 GB/s in the
+shipped configuration, on both compilers — but only with `HASHLIB_SIMD=OFF`,
+because `-march=native` would make the runtime dispatcher non-portable. For bulk
+hashing the batch kernels are worth 6x, so the tuning option is the wrong trade
+unless the workload is a single message at a time.
+
+The option has to apply to every translation unit that imports the module, not
+just to the library. A Clang module BMI records the target features it was built
+with, and importing it from a TU with a different feature set is a hard error
+(`precompiled file ... was compiled with the target feature '+avx512f' but the
+current translation unit is not`), so `src/HashLib/CMakeLists.txt` attaches the
+flags to an `INTERFACE` target linked `PUBLIC` and the options reach `HashApp`
+and the tests through the library's usage requirements.
 
 ## GCC vs Clang
 
@@ -324,6 +371,45 @@ The 4.75 cycles per step that 1.16 GB/s works out to at 5.51 GHz is the
 structural floor: rounds 1, 2 and 4 need two operations on the accumulator
 before the rotate and round 3 needs one, `(16*5 + 16*5 + 16*4 + 16*5) / 64 =
 4.75`.
+
+### The `Pin` barrier
+
+The four shapes above are what one source line produces under different tunings.
+`md5_fast` now blocks the reassociation with an empty inline-asm barrier:
+
+```cpp
+const std::uint32_t message = Pin(k + LoadLe32(block + 4 * g));
+target = std::rotl((target + message) + f, shift) + x;
+```
+
+`Pin()` is `asm volatile("" : "+r"(value))` on GCC and Clang, and the identity on
+MSVC. It emits no instructions; it stops the optimiser sinking `k` or `X[g]`
+behind `f`, which is what puts a third dependent operation on the rotate's
+chain.
+
+Re-measured, 1 MiB, same harness, same machine:
+
+| build | before | after | |
+|---|---|---|---|
+| gcc `-march=native` (znver5) | 0.963 | 1.166 | 1.21x |
+| gcc `-mtune=generic` | 1.167 | 1.160 | 1.00x |
+| clang `-march=native` | 1.048 | 1.163 | 1.11x |
+| clang `-mtune=generic` | 0.964 | 1.164 | 1.21x |
+| clang `-march=x86-64` (shipped build) | 0.921 | 1.106 | 1.20x |
+
+The compiler and tuning spread is gone: every `-march=native` configuration now
+lands at 1.16 GB/s, 4.75 cycles per step, which is the structural floor. Two of
+the conclusions above are therefore historical: `-mtune=generic` is no longer
+needed for `md5_fast`, and the four "shapes" are now one shape on every compiler.
+`-march=native` is still worth 5% over the baseline ISA (1.106 to 1.163) because
+it enables `rorx`, `andn` and BMI2, but the *tuning* half of the flag no longer
+matters.
+
+One measurement trap comes with it: because the barrier is `volatile`, the hash
+is no longer a pure expression to the optimiser, so the old and new code cannot
+be compared by calling them in a loop with an invariant input — GCC hoists the
+old version out of the loop and reports 0.6 ns for a 1 MiB call. Use an opaque
+function pointer, as the A/B harness in this repository does.
 
 ### Clang's spilling
 
