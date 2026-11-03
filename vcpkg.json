@@ -9,6 +9,7 @@
             "name": "gtest",
             "version>=": "1.13.0"
         },
-        "cli11"
+        "cli11",
+        "xsimd"
     ]
 }

@@ -26,8 +26,17 @@ modern-cmake-app-template/
 │   │   └── main.cpp                        # import std; + import logiface; + import hashlib;
 │   └── HashLib/
 │       ├── CMakeLists.txt
-│       ├── hashlib.cpp                     # module hashlib; (definition)
-│       └── hashlib.cppm                    # export module hashlib; (interface)
+│       ├── hashlib.cpp                     # module hashlib; (naive_md5 + md5_fast)
+│       ├── hashlib.cppm                    # export module hashlib; (interface)
+│       ├── utilities.cpp
+│       ├── utilities.cppm
+│       └── batch/
+│           ├── batch.cppm                  # export module hashlib.batch; (ABI + 64-step body)
+│           ├── hash_many.cpp               # module hashlib; (padding + lane scheduling)
+│           ├── dispatch.cpp                # module hashlib.batch; (CPU detection, best kernel)
+│           ├── kernel_sse2.cpp             # module hashlib.batch; 4 lanes
+│           ├── kernel_avx2.cpp             # module hashlib.batch; 8 lanes
+│           └── kernel_avx512.cpp           # module hashlib.batch; 16 lanes
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── hashlib_tests.cpp                   # gtest headers first, then import std;
@@ -53,19 +62,45 @@ const hashlib::Digest digest =
 `hashlib::Digest` is the raw 16-byte result; format it as hex (or base64) at the
 call site if a printable representation is needed.
 
-Two implementations are exported. They produce identical digests for every
-input, so the choice is purely about speed versus readability:
+Three implementations are exported. They produce identical digests for every
+input, so the choice is purely about the shape of the workload:
 
 | function | allocation | notes |
 |---|---|---|
 | `hashlib::naive_md5` | yes (`std::vector`) | follows the Wikipedia pseudocode closely; intended for learning and benchmarking |
-| `hashlib::md5_fast` | none, `noexcept` | 64-byte blocks hashed in place, 64 steps expanded at compile time, state kept in registers; ~3x the throughput of `naive_md5` as currently written (see `docs/md5-optimization.md` for why the naive one is that slow) |
+| `hashlib::md5_fast` | none, `noexcept` | single message; 64-byte blocks hashed in place, 64 steps expanded at compile time, state kept in registers; ~3x the throughput of `naive_md5` as currently written (see `docs/md5-optimization.md` for why the naive one is that slow) |
+| `hashlib::md5_batch` | none, `noexcept` | many independent messages at once, hashed `lanes` at a time with SSE2, AVX2 or AVX-512F selected at runtime |
 
-Both are single-shot, not streaming, and neither is a security primitive (MD5 is
+MD5 cannot be parallelised *inside* one message: the 64 steps and the block
+chaining are a serial dependency chain. `md5_batch` therefore exploits the other
+axis — independent messages — and is the throughput path for hashing many
+files, records or candidate strings. The batch kernel is selected once from the
+CPU that runs the binary, so a build made on an SSE2-only machine still uses
+AVX2 or AVX-512 on a newer one:
+
+```cpp
+std::vector<std::string> texts = ...;
+std::vector<std::span<const std::byte>> inputs;
+std::vector<hashlib::Digest> digests(texts.size());
+for (const std::string& text : texts) {
+    inputs.emplace_back(std::as_bytes(std::span{text.data(), text.size()}));
+}
+hashlib::md5_batch(inputs, digests);
+
+const hashlib::BatchInfo info = hashlib::md5_batch_info();
+// info.isa == "avx512f" / "avx2" / "sse2" / "scalar", info.lanes == 16 / 8 / 4 / 1
+```
+
+`HASHLIB_SIMD=OFF` builds a scalar-only library. `HASHLIB_FORCE_ISA` can force
+one kernel (`sse2`, `avx2`, `avx512f`, `scalar`) so every path is testable on
+one machine; unknown or unavailable names fall back to scalar.
+
+All are single-shot, not streaming, and none is a security primitive (MD5 is
 cryptographically broken). Known-answer tests (RFC 1321 plus padding and
 large-input edges) run against every exported implementation in
-`tests/hashlib_tests.cpp`; the measurements behind `md5_fast` are in
-`docs/md5-optimization.md`.
+`tests/hashlib_tests.cpp`; the batch path is additionally checked against
+`md5_fast` for mixed lengths and batch sizes. The measurements behind
+`md5_fast` and the SIMD kernels are in `docs/md5-optimization.md`.
 
 The CLI runs the implementations side by side, which doubles as a correctness
 check:
@@ -74,6 +109,7 @@ check:
 HashApp "hello"                  # every implementation, all must agree
 HashApp -a fast "hello"          # just one; -a naive,fast or -a fast -a naive for a subset
 HashApp -a all -b --benchmark-count 100000 "hello"
+HashApp -b --benchmark-batch 16 "hello"   # md5_batch: ns/call and ns/hash
 ```
 
 ## Prerequisites
@@ -110,6 +146,8 @@ Options:
 - `-DCLANG_TIDY_ENABLED=OFF` to skip clang-tidy configuration
 - `-DUSE_LIBCPP=ON` to build against libc++ instead of libstdc++ (Clang only; configuration fails if libc++ is unavailable)
 - `-DENABLE_SANITIZERS=OFF` to skip the Debug ASan/UBSan build (default: ON, and forced OFF on Windows/MinGW)
+- `-DHASHLIB_SIMD=OFF` to build a scalar-only library instead of the runtime-dispatched SSE2/AVX2/AVX-512 batch kernels (default: ON)
+- `-DHASHLIB_NATIVE_TUNING=ON` to tune the library for the build machine (OFF by default; mutually exclusive with `HASHLIB_SIMD`, because `-march=native` would make the dispatcher itself non-portable)
 
 C++26 and `import std;` are mandatory; there is no header-based configuration to fall back to.
 
@@ -166,6 +204,23 @@ import logiface;                         // Logiface types
 
 Note the logging interface uses a raw-pointer API: `Logiface::ConsoleLogger
 app_logger;` + `Logiface::SetLogger(&app_logger);`.
+
+### Per-ISA modules
+
+`hashlib.batch` is an internal module, not part of the exported API. Its single
+interface (`batch/batch.cppm`) is compiled at `-march=x86-64` and holds both the
+kernel ABI and the xsimd-free 64-step body. The SSE2/AVX2/AVX-512 kernels are
+**module implementation units** of that module built with per-source
+`-mavx2`/`-mavx512f`. Implementation units contribute definitions but emit no
+BMI, so the baseline dispatcher never loads a BMI compiled with a newer ISA —
+which Clang would reject with a target-feature configuration mismatch. The only
+textual include left in that area is third-party `xsimd` in each kernel's global
+module fragment, because xsimd selects its architecture from
+`__AVX2__`/`__AVX512F__` at include time.
+
+The dispatcher (`batch/dispatch.cpp`) asks the compiler instead of executing
+CPUID itself: `__builtin_cpu_supports` on GCC/Clang, and `_xgetbv`/`__cpuidex`
+intrinsics on MSVC. There is no inline assembly in the batch path.
 
 ### GTest and `import std;`
 

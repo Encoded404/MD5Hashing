@@ -244,12 +244,76 @@ void PrintDigests(std::span<const std::byte> input,
     }
 }
 
+// The batch API hashes `batchSize` independent messages per call. Report the
+// cost of the call itself and the cost per individual digest; the latter is
+// what matters for throughput and is the number that beats md5_fast.
+void BenchmarkBatch(std::span<const std::byte> input, int iterations, int batchSize) {
+    const hashlib::BatchInfo info = hashlib::md5_batch_info();
+
+    // Independent copies, so the kernel reads different buffers. MD5's cost is
+    // data-independent, but identical pointers would not measure the real
+    // memory behaviour.
+    std::string message(input.size(), '\0');
+    if (!input.empty()) {
+        std::memcpy(message.data(), input.data(), input.size());
+    }
+    std::vector<std::string> messages(static_cast<std::size_t>(batchSize), message);
+
+    std::vector<std::span<const std::byte>> inputs;
+    inputs.reserve(messages.size());
+    for (const std::string& text : messages) {
+        inputs.emplace_back(std::as_bytes(std::span{text.data(), text.size()}));
+    }
+
+    std::vector<hashlib::Digest> digests(messages.size());
+
+    // A mismatch would make the timing meaningless.
+    hashlib::md5_batch(inputs, digests);
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        if (digests[i] != hashlib::md5_fast(inputs[i])) {
+            LOGIFACE_LOG(error, "Skipping batch benchmark: md5_batch disagrees with md5_fast");
+            return;
+        }
+    }
+
+    Timer::Timer timer(true);
+    for (int i = 0; i < iterations; ++i) {
+        hashlib::md5_batch(inputs, digests);
+        DoNotOptimize(digests);
+    }
+    timer.Stop();
+
+    const double nanosecondsPerCall = timer.ElapsedNs() / static_cast<double>(iterations);
+    const double nanosecondsPerHash = nanosecondsPerCall / static_cast<double>(batchSize);
+
+    std::string line = "md5_batch (" + std::string(info.isa) + ", " +
+                       std::to_string(info.lanes) + " lane(s)): " + std::to_string(iterations) +
+                       " call(s) x " + std::to_string(batchSize) + " hash(es) in " +
+                       ToFixed(timer.ElapsedMs(), 1) + " ms, " +
+                       ToFixed(nanosecondsPerCall, 1) + " ns/call, " +
+                       ToFixed(nanosecondsPerHash, 1) + " ns/hash";
+    if (!input.empty()) {
+        // bytes per nanosecond is GB/s
+        line += ", " +
+                ToFixed(static_cast<double>(batchSize) * static_cast<double>(input.size()) /
+                            nanosecondsPerCall,
+                        2) +
+                " GB/s";
+    }
+    std::cout << line << '\n';
+}
+
 void Benchmark(std::span<const std::byte> input, const std::vector<const Algorithm*>& algorithms,
-               int iterations) {
+               int iterations, int batchSize) {
     if (iterations <= 0) {
         LOGIFACE_LOG(warn, "Skipping benchmark: --benchmark-count must be positive");
         return;
     }
+
+    if (batchSize > 0) {
+        BenchmarkBatch(input, iterations, batchSize);
+    }
+
     if (algorithms.empty()) {
         return;
     }
@@ -335,6 +399,14 @@ int main(int argc, char** argv) {
     app.add_option("--benchmark-count", benchmark_count)
         ->default_val(1000000);
 
+    int benchmark_batch = 16;
+    app.add_option("--benchmark-batch", benchmark_batch,
+                   "Messages per md5_batch call in the benchmark (0 disables the batch "
+                   "benchmark)")
+        ->default_val(16)
+        ->check(CLI::NonNegativeNumber)
+        ->capture_default_str();
+
     CLI11_PARSE(app, argc, argv);
 
     // CLI11 already validated the value; the fallback only fires if the two
@@ -362,7 +434,7 @@ int main(int argc, char** argv) {
     PrintDigests(input, selection.algorithms);
 
     if (benchmark) {
-        Benchmark(input, selection.algorithms, benchmark_count);
+        Benchmark(input, selection.algorithms, benchmark_count, benchmark_batch);
     }
 
     LOGIFACE_LOG(info, "App completed");

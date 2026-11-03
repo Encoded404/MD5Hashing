@@ -159,3 +159,87 @@ TEST(HashLibTest, Md5HandlesBinaryBytes) {
         EXPECT_EQ(function(input), reference);
     }
 }
+
+// The batch entry point must agree with the single-message implementations.
+// Each lane is padded independently, so mixed lengths (and lengths on both
+// sides of the 55/56 and 63/64 boundaries) are the interesting cases.
+TEST(HashLibTest, Md5BatchKnownAnswerVectors) {
+    constexpr std::array kCases{
+        std::pair{std::string_view{""}, std::string_view{"d41d8cd98f00b204e9800998ecf8427e"}},
+        std::pair{std::string_view{"a"}, std::string_view{"0cc175b9c0f1b6a831c399e269772661"}},
+        std::pair{std::string_view{"abc"}, std::string_view{"900150983cd24fb0d6963f7d28e17f72"}},
+        std::pair{std::string_view{"message digest"},
+                  std::string_view{"f96b697d7cb7938d525a2f31aaf161d0"}},
+        std::pair{std::string_view{"The quick brown fox jumps over the lazy dog"},
+                  std::string_view{"9e107d9d372bb6826bd81d3542a419d6"}},
+    };
+
+    std::vector<std::span<const std::byte>> inputs;
+    inputs.reserve(kCases.size());
+    for (const auto& [text, expected] : kCases) {
+        (void)expected;
+        inputs.emplace_back(std::as_bytes(std::span{text.data(), text.size()}));
+    }
+
+    std::vector<hashlib::Digest> digests(inputs.size());
+    hashlib::md5_batch(inputs, digests);
+
+    for (std::size_t i = 0; i < kCases.size(); ++i) {
+        SCOPED_TRACE(std::string(kCases[i].first));
+        EXPECT_EQ(ToHex(digests[i]), kCases[i].second);
+    }
+}
+
+TEST(HashLibTest, Md5BatchReportsKernel) {
+    const hashlib::BatchInfo info = hashlib::md5_batch_info();
+    EXPECT_FALSE(info.isa.empty());
+    EXPECT_TRUE(info.isa == "avx512f" || info.isa == "avx2" || info.isa == "sse2" ||
+                info.isa == "scalar");
+    EXPECT_TRUE(info.lanes == 1 || info.lanes == 4 || info.lanes == 8 || info.lanes == 16);
+}
+
+TEST(HashLibTest, Md5BatchMatchesSingleForMixedLengths) {
+    constexpr std::array<std::size_t, 19> kLengths{
+        0, 1, 2, 3, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 191, 192, 255, 1000};
+
+    for (const std::size_t batchSize :
+         {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{4}, std::size_t{7},
+          std::size_t{8}, std::size_t{9}, std::size_t{15}, std::size_t{16}, std::size_t{17},
+          std::size_t{31}, std::size_t{64}, std::size_t{257}}) {
+        SCOPED_TRACE("batch size " + std::to_string(batchSize));
+
+        std::vector<std::string> messages;
+        messages.reserve(batchSize);
+        for (std::size_t i = 0; i < batchSize; ++i) {
+            const std::size_t length = kLengths[(i * 7 + batchSize) % kLengths.size()];
+            std::string message(length, '\0');
+            for (std::size_t j = 0; j < length; ++j) {
+                // Position-dependent: repeated bytes hide a wrong message index.
+                message[j] = static_cast<char>((i * 131 + j * 37 + 11) & 0xFF);
+            }
+            messages.push_back(std::move(message));
+        }
+
+        std::vector<std::span<const std::byte>> inputs;
+        inputs.reserve(batchSize);
+        for (const std::string& message : messages) {
+            inputs.emplace_back(std::as_bytes(std::span{message.data(), message.size()}));
+        }
+
+        // Deliberately oversized: the API promises to write only inputs.size().
+        std::vector<hashlib::Digest> digests(batchSize + 3);
+        hashlib::md5_batch(inputs, digests);
+
+        for (std::size_t i = 0; i < batchSize; ++i) {
+            SCOPED_TRACE("index " + std::to_string(i));
+            EXPECT_EQ(digests[i], hashlib::md5_fast(inputs[i]));
+        }
+    }
+}
+
+TEST(HashLibTest, Md5BatchHandlesEmptyBatch) {
+    std::vector<std::span<const std::byte>> inputs;
+    std::vector<hashlib::Digest> digests;
+    hashlib::md5_batch(inputs, digests);
+    EXPECT_TRUE(digests.empty());
+}

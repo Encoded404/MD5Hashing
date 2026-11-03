@@ -338,6 +338,21 @@ option(ENABLE_LOGGING "Enable header-only logging interface" ON)
 option(HASHLIB_NATIVE_TUNING
 	"Tune the MD5 hash core for the build machine (-march=native -mtune=generic)" OFF)
 
+# Runtime-dispatched batched MD5 kernels (SSE2 / AVX2 / AVX-512F) behind
+# `hashlib::md5_batch`. These are compiled per architecture and selected on the
+# CPU that runs the binary, so the build machine's ISA does not matter.
+option(HASHLIB_SIMD "Build runtime-dispatched SIMD batch kernels" ON)
+
+# -march=native on the rest of the library defeats the point of dispatch: the
+# "baseline" code would then require the build machine's ISA and the binary
+# could not run on an older CPU to select a kernel in the first place.
+if(HASHLIB_NATIVE_TUNING AND HASHLIB_SIMD)
+	message(FATAL_ERROR
+		"HASHLIB_NATIVE_TUNING and HASHLIB_SIMD are mutually exclusive: "
+		"-march=native makes the baseline non-portable, so the runtime dispatcher "
+		"could crash before it gets to choose a kernel. Turn one of them off.")
+endif()
+
 option(CLANG_TIDY_ENABLED "Enable Clang-Tidy static analysis" ON)
 # disable Clang-Tidy if not using Clang or GCC
 if(CLANG_TIDY_ENABLED AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

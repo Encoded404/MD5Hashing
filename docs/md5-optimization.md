@@ -137,6 +137,88 @@ SIMD only helps when independent messages are batched into lanes: four with
 SSE2, eight with AVX2, sixteen with AVX-512. That needs a different API, not a
 faster single-message `md5(span)`.
 
+### `md5_batch`: one kernel per ISA, chosen at runtime
+
+`hashlib::md5_batch` is that API. It hashes `lanes` independent messages per
+compression, with `lanes` = 4 (SSE2), 8 (AVX2), 16 (AVX-512F), or 1 (scalar).
+Each message is padded independently, so lengths may differ; lanes that finish
+early are fed zero blocks and their digest is captured right after their own
+last block.
+
+The batch subsystem is one internal module plus the implementation units around
+it:
+
+- `batch/batch.cppm` declares the kernel ABI and holds the xsimd-free 64-step
+  body; it is compiled at `-march=x86-64`;
+- `batch/kernel_sse2.cpp`, `batch/kernel_avx2.cpp`, `batch/kernel_avx512.cpp`
+  are `module hashlib.batch;` implementation units compiled with
+  `-march=x86-64`, `-mavx2`, and `-mavx2 -mavx512f` respectively;
+- `batch/dispatch.cpp` is also an implementation unit, compiled at
+  `-march=x86-64`. It asks the compiler for the CPU features
+  (`__builtin_cpu_supports` on GCC/Clang, `_xgetbv`/`__cpuidex` intrinsics on
+  MSVC) and returns a function pointer. It is deliberately baseline: if the
+  dispatcher itself contained AVX, the binary would fault before it could
+  choose a kernel;
+- `batch/hash_many.cpp` is an implementation unit of `module hashlib`, not of
+  `hashlib.batch`. It owns the per-lane padding and block scheduling for
+  `md5_batch` and calls whichever kernel the dispatcher selected.
+
+Implementation units emit no BMI, which is the point: Clang records target
+features in a BMI and rejects importing an AVX2/AVX-512 BMI from baseline code,
+so a module or partition compiled with those flags cannot be used by the
+dispatcher. Implementation units are part of the module, are type-checked
+against its interface, and are compiled with whatever per-source flags that ISA
+needs. The only textual include left is third-party `xsimd` in each kernel's
+global module fragment, because xsimd selects its architecture from
+`__AVX2__`/`__AVX512F__` at include time.
+
+The 64 steps are written as four explicit rounds with the canonical
+`a`/`d`/`c`/`b` role rotation. Each call names its message word directly, so
+there is no runtime message index and no role-selection table, and the
+compression function's state words are locals rather than references into a
+caller's stack frame. Clang keeps them in registers for the whole block; the
+only state stores are the four at the end.
+
+This is what makes a build on an SSE2-only machine useful: the compiler can
+emit AVX2/AVX-512 code without the build host supporting it, and the selection
+runs on the CPU that executes the binary. The build host's ISA only matters if
+`-march=native` leaks in, which is why `HASHLIB_NATIVE_TUNING` and
+`HASHLIB_SIMD` are mutually exclusive.
+
+The 16-lane kernel transposes with four 8×8 AVX2 transposes (xsimd 13's
+32-bit AVX-512 transpose is a scalar scratch-buffer fallback) and joins each
+pair with `vinserti64x4`. On AVX2 the 16 schedule vectors plus four state
+vectors exceed the 16 `ymm` registers, so the compiler reloads or moves parts
+of the schedule during the rounds; AVX-512 has 32 `zmm` registers and fits the
+whole working set.
+
+Measured on an i5-1250P (AVX2, no AVX-512), Clang 21 + libc++, baseline
+`-march=x86-64` build, 43-byte text:
+
+| path | ns/call | ns/hash | GB/s |
+|---|---|---|---|
+| `md5_fast` (single) | 82.2 | 82.2 | 0.52 |
+| `md5_batch`, 8 messages/call | 143.8 | 18.0 | 2.39 |
+| `md5_batch`, 16 messages/call | 278.7 | 17.4 | 2.47 |
+| `md5_batch`, 64 messages/call | 1096.4 | 17.1 | 2.51 |
+
+At 4 KiB per message the setup cost disappears and the kernel dominates:
+
+| path | ns/hash | GB/s |
+|---|---|---|
+| `md5_fast` | 5104.0 | 0.80 |
+| `md5_batch`, 16 messages/call | 824.7 | 4.97 |
+| `md5_batch`, 64 messages/call | 818.7 | 5.00 |
+
+So the batch path is about 4.7× at 43 bytes and 6.2× at 4 KiB on AVX2. The
+remaining gap to the 8-lane ideal is the per-block schedule transpose, the
+scalar padding of every lane, and AVX2's three-instruction rotate. AVX-512
+uses one `vprold`, `vpternlogd` for F, and twice the lanes; it compiles to
+`zmm`/`vprold`/`vpternlogd` (verified with `objdump`) but was not run here
+because this CPU has no AVX-512. `HASHLIB_FORCE_ISA=sse2|avx2|avx512f|scalar`
+exercises each available kernel on one machine; Intel SDE or a Zen 4/5 runner
+is needed to execute the AVX-512 path.
+
 ## Compiler flags
 
 `-march=native` implies `-mtune=znver5` on GCC, and GCC's znver5 model produces
