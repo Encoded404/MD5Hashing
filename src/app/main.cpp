@@ -10,6 +10,7 @@ import logiface.ConsoleLogger;
 import Timer;
 
 import hashlib;
+import solve;
 
 void initializeLogger(Logiface::Level level);
 
@@ -289,7 +290,8 @@ void BenchmarkBatch(std::span<const std::byte> input, int iterations, int batchS
     std::string line = "md5_batch (" + std::string(info.isa) + ", " +
                        std::to_string(info.lanes) + " lane(s)): " + std::to_string(iterations) +
                        " call(s) x " + std::to_string(batchSize) + " hash(es) in " +
-                       ToFixed(timer.ElapsedMs(), 1) + " ms, " +
+                       Timer::FormatDuration(std::chrono::nanoseconds{timer.ElapsedNsInt()}) +
+                       ", " +
                        ToFixed(nanosecondsPerCall, 1) + " ns/call, " +
                        ToFixed(nanosecondsPerHash, 1) + " ns/hash";
     if (!input.empty()) {
@@ -341,8 +343,8 @@ void Benchmark(std::span<const std::byte> input, const std::vector<const Algorit
             timer.ElapsedNs() / static_cast<double>(iterations);
         std::string line = "md5 (" + std::string(algorithm->name) + "): " +
                            std::to_string(iterations) + " call(s) in " +
-                           ToFixed(timer.ElapsedMs(), 1) + " ms, " +
-                           ToFixed(nanosecondsPerCall, 1) + " ns/call";
+                           Timer::FormatDuration(std::chrono::nanoseconds{timer.ElapsedNsInt()}) +
+                           ", " + ToFixed(nanosecondsPerCall, 1) + " ns/call";
         if (!input.empty()) {
             // bytes per nanosecond is GB/s
             line += ", " + ToFixed(static_cast<double>(input.size()) / nanosecondsPerCall, 2) +
@@ -362,8 +364,148 @@ void Benchmark(std::span<const std::byte> input, const std::vector<const Algorit
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// solve mode
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct SolveOptions {
+    std::string digest;
+    std::string same_as;
+    std::string anagram_of;
+    std::string wordlist;
+    std::string solver = "auto";
+    std::uint64_t max_candidates = 0;
+    bool explain = false;
+    bool dry_run = false;
+    bool list_solvers = false;
+};
+
+// `--wordlist '~/Downloads/wordlist'` is a common way to pass a path from a shell where the tilde was quoted.
+// Expand a leading `~` instead of handing a literal tilde to the filesystem.
+std::filesystem::path ExpandHome(const std::filesystem::path& path) {
+    const std::string text = path.string();
+    if (text.empty() || text.front() != '~') {
+        return path;
+    }
+    if (text.size() > 1 && text[1] != '/' && text[1] != '\\') {
+        return path;
+    }
+
+#ifdef _WIN32
+    const char* home = std::getenv("USERPROFILE");
+    if (home == nullptr) {
+        home = std::getenv("HOME");
+    }
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    if (home == nullptr || *home == '\0') {
+        return path;
+    }
+    if (text.size() == 1) {
+        return std::filesystem::path{home};
+    }
+    return std::filesystem::path{home} / text.substr(2);
+}
+
+std::optional<hashlib::Digest> ResolveTarget(const SolveOptions& options, std::string& error) {    if (!options.digest.empty() && !options.same_as.empty()) {
+        error = "--digest and --same-as are mutually exclusive";
+        return std::nullopt;
+    }
+    if (!options.digest.empty()) {
+        const std::optional<hashlib::Digest> digest = solve::ParseDigest(options.digest);
+        if (!digest) {
+            error = "--digest must be exactly 32 hexadecimal characters";
+        }
+        return digest;
+    }
+    if (!options.same_as.empty()) {
+        const std::span<const std::byte> bytes =
+            std::as_bytes(std::span{options.same_as.data(), options.same_as.size()});
+        return hashlib::md5_fast(bytes);
+    }
+    error = "one of --digest or --same-as is required";
+    return std::nullopt;
+}
+
+int RunSolve(const SolveOptions& options, CLI::App& app) {
+    if (options.list_solvers) {
+        for (const solve::SolverInfo& info : solve::Solvers()) {
+            std::cout << info.id << "  " << info.summary
+                      << (info.complete ? "  [exhaustive]" : "  [wordlist only]") << '\n';
+        }
+        return 0;
+    }
+
+    std::string error;
+    const std::optional<hashlib::Digest> target = ResolveTarget(options, error);
+    if (!target) {
+        return app.exit(CLI::ValidationError("solve", error));
+    }
+
+    solve::SearchProblem problem;
+    problem.target.digest = *target;
+    problem.anagram = solve::Anagram{options.anagram_of};
+    if (!options.wordlist.empty()) {
+        problem.wordlist =
+            solve::Wordlist{ExpandHome(std::filesystem::path{options.wordlist})};
+    }
+    problem.max_candidates = options.max_candidates;
+
+    const std::optional<solve::Plan> plan = solve::PlanSearch(problem, options.solver, error);
+    if (!plan) {
+        return app.exit(CLI::ValidationError("solve", error));
+    }
+
+    if (options.explain || options.dry_run) {
+        LOGIFACE_LOG(info, "solver: " + std::string(plan->solver) + " (" + plan->reason + ")");
+    }
+    if (plan->solver == "permutations" && plan->estimated_candidates > 50'000'000 &&
+        options.max_candidates == 0) {
+        LOGIFACE_LOG(warn, "about " + std::to_string(plan->estimated_candidates) +
+                               " permutations will be tried; pass --max-candidates to bound "
+                               "the search or --wordlist to use a dictionary");
+    }
+    if (options.dry_run) {
+        return 0;
+    }
+    if (!options.same_as.empty() && options.same_as == options.anagram_of) {
+        LOGIFACE_LOG(warn,
+                     "--same-as equals --anagram-of; the identity permutation is a candidate "
+                     "and will match immediately");
+    }
+
+    LOGIFACE_LOG(info, "searching with the " + std::string(plan->solver) + " solver");
+    const solve::Outcome outcome = solve::Solve(problem, options.solver);
+
+    switch (outcome.status) {
+        case solve::Status::found:
+            std::cout << outcome.solution->candidate << '\n';
+            LOGIFACE_LOG(info, "found after " + std::to_string(outcome.stats.candidates) +
+                                   " hash(es) (" + std::to_string(outcome.stats.scanned) +
+                                   " search step(s)) in " +
+                                   Timer::FormatDuration(outcome.stats.elapsed));
+            return 0;
+        case solve::Status::exhausted:
+            LOGIFACE_LOG(error, outcome.message);
+            if (plan->solver == "dictionary") {
+                LOGIFACE_LOG(info,
+                             "the answer may not be in the wordlist; rerun with "
+                             "--solver permutations for an exhaustive search");
+            }
+            return 1;
+        case solve::Status::invalid:
+            return app.exit(CLI::ValidationError("solve", outcome.message));
+    }
+    return 1;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
-    CLI::App app{"Compute the MD5 digest of a string"};
+    CLI::App app{"Compute the MD5 digest of a string, or solve an anagram-hash challenge"};
 
     std::string text = "The quick brown fox jumps over the lazy dog";
     app.add_option("text", text, "Text to hash")
@@ -407,6 +549,50 @@ int main(int argc, char** argv) {
         ->check(CLI::NonNegativeNumber)
         ->capture_default_str();
 
+    // `solve` is a subcommand so its options only appear in its own help.
+    // The parent positional `text` and options are still usable, and fallthrough() lets parent flags such as --log-level appear after the subcommand.
+    auto* solve_command = app.add_subcommand(
+        "solve", "Find a string with a given MD5 digest (anagram constraint, optional wordlist)");
+    solve_command->fallthrough();
+
+    std::string solve_digest;
+    solve_command->add_option("--digest", solve_digest,
+                              "Target MD5 digest as exactly 32 hexadecimal characters");
+    std::string solve_same_as;
+    solve_command->add_option("--same-as", solve_same_as,
+                              "Use the MD5 of this string as the target instead of --digest");
+    std::string solve_anagram;
+    solve_command->add_option("--anagram-of", solve_anagram,
+                              "Candidates must have exactly these characters; spaces select "
+                              "the phrase solver (which tries 2-8 word counts)");
+    std::string solve_wordlist;
+    solve_command->add_option(
+        "--wordlist", solve_wordlist,
+        "Dictionary file: plain text (one entry per line), CSV/TSV or a JSON array; "
+        "leading ~ is expanded");
+    std::string solve_solver = "auto";
+    solve_command
+        ->add_option("--solver", solve_solver,
+                     "Search strategy: auto, permutations, dictionary or phrase")
+        ->check(CLI::IsMember({"auto", "permutations", "dictionary", "phrase"},
+                              CLI::ignore_case))
+        ->capture_default_str();
+    std::uint64_t solve_max_candidates = 0;
+    solve_command
+        ->add_option("--max-candidates", solve_max_candidates,
+                     "Stop after hashing this many candidates (0 = no limit)")
+        ->capture_default_str();
+    bool solve_explain = false;
+    solve_command->add_flag("--explain", solve_explain,
+                            "Print the chosen solver and its cost estimate");
+    bool solve_dry_run = false;
+    solve_command->add_flag("--dry-run", solve_dry_run, "Plan only; do not search");
+    bool solve_list_solvers = false;
+    solve_command->add_flag("--list-solvers", solve_list_solvers,
+                            "List the available solvers and exit");
+
+    app.require_subcommand(0, 1);
+
     CLI11_PARSE(app, argc, argv);
 
     // CLI11 already validated the value; the fallback only fires if the two
@@ -420,6 +606,30 @@ int main(int argc, char** argv) {
 
     LOGIFACE_LOG(info, "HashApp CLI started");
     LOGIFACE_LOG(debug, std::string("Log level set to ") + Logiface::ToString(*level));
+
+    if (solve_command->parsed()) {
+        if (benchmark) {
+            return app.exit(CLI::ValidationError(
+                "--benchmark", "--benchmark is only available in hash mode"));
+        }
+        if (!algorithm_list.empty()) {
+            LOGIFACE_LOG(warn,
+                         "-a/--algorithm selects a hash implementation in hash mode; solve mode "
+                         "always uses md5_batch");
+        }
+
+        SolveOptions options;
+        options.digest = std::move(solve_digest);
+        options.same_as = std::move(solve_same_as);
+        options.anagram_of = std::move(solve_anagram);
+        options.wordlist = std::move(solve_wordlist);
+        options.solver = std::move(solve_solver);
+        options.max_candidates = solve_max_candidates;
+        options.explain = solve_explain;
+        options.dry_run = solve_dry_run;
+        options.list_solvers = solve_list_solvers;
+        return RunSolve(options, app);
+    }
 
     Selection selection = SelectAlgorithms(algorithm_list);
     if (!selection.error.empty()) {

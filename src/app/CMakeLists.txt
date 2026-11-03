@@ -11,7 +11,7 @@ target_sources(${APP_TARGET} PRIVATE
         Timer.cppm
 )
 
-target_link_libraries(${APP_TARGET} PRIVATE ${HASH_LIBRARY_TARGET})
+target_link_libraries(${APP_TARGET} PRIVATE ${HASH_LIBRARY_TARGET} ${SOLVE_LIBRARY_TARGET})
 
 # CLI parsing. CLI11 is a vcpkg dependency (see vcpkg.json); the `libcxx` preset
 # builds it against libc++ through the x64-linux-libcxx overlay triplet, so its

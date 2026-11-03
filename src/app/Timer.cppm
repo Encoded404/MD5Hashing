@@ -32,4 +32,8 @@ private:
     static std::int64_t Now() noexcept;
 };
 
-} // namespace VulkanShared
+/// Formats a duration with three significant digits and an auto-scaled unit (ns, us, ms, s, min, h).
+/// Zero prints as "0 ns".
+[[nodiscard]] std::string FormatDuration(std::chrono::nanoseconds duration);
+
+} // namespace Timer

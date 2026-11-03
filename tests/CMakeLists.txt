@@ -1,5 +1,5 @@
 # Add the test executable
-add_executable(hashlib_tests hashlib_tests.cpp)
+add_executable(hashlib_tests hashlib_tests.cpp solve_tests.cpp)
 
 # Test-only support module. GTest's headers stay in its global module fragment;
 # the test TU includes them before `import std;` (see hashlib_tests.cpp).
@@ -21,6 +21,7 @@ find_package(GTest CONFIG REQUIRED)
 include(GoogleTest)
 target_link_libraries(hashlib_tests PRIVATE
     ${HASH_LIBRARY_TARGET}
+    ${SOLVE_LIBRARY_TARGET}
     GTest::gtest
     GTest::gtest_main
 )
@@ -48,6 +49,36 @@ gtest_discover_tests(hashlib_tests
     PROPERTIES
         ENVIRONMENT "TEST_LOG_DIR=${CMAKE_BINARY_DIR}/Testing/logs"
 )
+
+# End-to-end CLI smoke tests for `solve`.
+# The answer is the only thing written to stdout; the logger writes to std::clog.
+# A match here therefore means the result really came from the solver, not from a log line.
+add_test(NAME solve_cli_digest
+         COMMAND $<TARGET_FILE:${APP_TARGET}> solve
+                 --digest 839d7228b5ccc60e54455093a966b8c2
+                 --anagram-of silent)
+set_tests_properties(solve_cli_digest PROPERTIES PASS_REGULAR_EXPRESSION "listen")
+
+add_test(NAME solve_cli_same_as
+         COMMAND $<TARGET_FILE:${APP_TARGET}> solve
+                 --same-as listen --anagram-of silent)
+set_tests_properties(solve_cli_same_as PROPERTIES PASS_REGULAR_EXPRESSION "listen")
+
+add_test(NAME solve_cli_phrase
+         COMMAND $<TARGET_FILE:${APP_TARGET}> solve
+                 --digest 7533f6c3cf1f2e0b2667462c5518966f
+                 --anagram-of "silent to me"
+                 --wordlist ${CMAKE_CURRENT_SOURCE_DIR}/data/phrase-words.txt
+                 --solver phrase)
+set_tests_properties(solve_cli_phrase PROPERTIES PASS_REGULAR_EXPRESSION "listen to me")
+
+# A one-permutation space that cannot match.
+# The CLI must exit non-zero rather than print a candidate.
+add_test(NAME solve_cli_no_match
+         COMMAND $<TARGET_FILE:${APP_TARGET}> solve
+                 --digest 839d7228b5ccc60e54455093a966b8c2
+                 --anagram-of aaa)
+set_tests_properties(solve_cli_no_match PROPERTIES WILL_FAIL TRUE)
 
 # The batch dispatcher selects the widest kernel the CPU supports and caches it,
 # so the run above only ever executes one compiled kernel. Run the batch tests

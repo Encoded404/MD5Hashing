@@ -23,23 +23,29 @@ modern-cmake-app-template/
 │   ├── CMakeLists.txt
 │   ├── app/
 │   │   ├── CMakeLists.txt
-│   │   └── main.cpp                        # import std; + import logiface; + import hashlib;
-│   └── HashLib/
+│   │   └── main.cpp                        # import std; + import logiface; + import hashlib; + import solve;
+│   ├── HashLib/
+│   │   ├── CMakeLists.txt
+│   │   ├── hashlib.cpp                     # module hashlib; (naive_md5 + md5_fast)
+│   │   ├── hashlib.cppm                    # export module hashlib; (interface)
+│   │   ├── utilities.cpp
+│   │   ├── utilities.cppm
+│   │   └── batch/
+│   │       ├── batch.cppm                  # export module hashlib.batch; (ABI + 64-step body)
+│   │       ├── hash_many.cpp               # module hashlib; (padding + lane scheduling)
+│   │       ├── dispatch.cpp                # module hashlib.batch; (CPU detection, best kernel)
+│   │       ├── kernel_sse2.cpp             # module hashlib.batch; 4 lanes
+│   │       ├── kernel_avx2.cpp             # module hashlib.batch; 8 lanes
+│   │       └── kernel_avx512.cpp           # module hashlib.batch; 16 lanes
+│   └── SolveLib/
 │       ├── CMakeLists.txt
-│       ├── hashlib.cpp                     # module hashlib; (naive_md5 + md5_fast)
-│       ├── hashlib.cppm                    # export module hashlib; (interface)
-│       ├── utilities.cpp
-│       ├── utilities.cppm
-│       └── batch/
-│           ├── batch.cppm                  # export module hashlib.batch; (ABI + 64-step body)
-│           ├── hash_many.cpp               # module hashlib; (padding + lane scheduling)
-│           ├── dispatch.cpp                # module hashlib.batch; (CPU detection, best kernel)
-│           ├── kernel_sse2.cpp             # module hashlib.batch; 4 lanes
-│           ├── kernel_avx2.cpp             # module hashlib.batch; 8 lanes
-│           └── kernel_avx512.cpp           # module hashlib.batch; 16 lanes
+│       ├── solve.cpp                       # permutation/dictionary/phrase sources + batch engine
+│       └── solve.cppm                      # export module solve; (problem + selection API)
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── hashlib_tests.cpp                   # gtest headers first, then import std;
+│   ├── solve_tests.cpp                     # solve mode: sources, auto-selection, CLI vectors
+│   ├── data/phrase-words.txt               # phrase-solver CLI fixture
 │   └── test_logging.cppm                   # gtest in the global module fragment
 ├── vcpkg.json
 └── vcpkg-configuration.json
@@ -111,6 +117,60 @@ HashApp -a fast "hello"          # just one; -a naive,fast or -a fast -a naive f
 HashApp -a all -b --benchmark-count 100000 "hello"
 HashApp -b --benchmark-batch 16 "hello"   # md5_batch: ns/call and ns/hash
 ```
+
+## Anagram-hash solve mode
+
+`solve` recovers a string from its MD5 digest when the string's letters are
+known. The digest is the exact target and the letters are a hard constraint, so
+the candidate must be an anagram of the supplied text. A wordlist enables two
+further strategies: scan single words, or compose a multi-word phrase.
+
+```bash
+HashApp solve --digest 839d7228b5ccc60e54455093a966b8c2 --anagram-of silent
+HashApp solve --same-as listen --anagram-of silent
+HashApp solve --digest <32hex> --anagram-of silent --wordlist words.txt --explain
+HashApp solve --digest <32hex> --anagram-of silent --wordlist words.txt --dry-run
+HashApp solve --digest e4820b45d2277f3844eac66c903e84be \
+    --anagram-of "poultry outwits ants" --wordlist '~/Downloads/wordlist'
+HashApp solve --digest 665e5bcb0c20062fe8abaaf4628bb154 \
+    --anagram-of "poultry outwits ants" --wordlist '~/Downloads/wordlist'
+HashApp solve --list-solvers
+```
+
+`--digest` takes exactly 32 hex characters; `--same-as` computes the target from
+a string instead, which is convenient while testing (the two options are
+mutually exclusive). `--anagram-of` is the character multiset, not a word to
+look up; equality is byte-wise, which matches the challenge's ASCII payloads.
+With `--wordlist`, `auto` compares the number of distinct permutations
+(`n! / ∏ cᵢ!`) with the number of wordlist entries and picks the cheaper
+single-word strategy; `--solver permutations|dictionary|phrase` forces one.
+
+If `--anagram-of` contains spaces, `auto` treats it as a multi-word anagram and
+selects the `phrase` solver, which requires a wordlist. The phrase solver strips
+the clue's spaces (they are separators, not anagram characters), then tries
+2- to 8-word phrases: it finds wordlist words whose letter counts sum to the
+target and hashes the joined phrase. The clue's own word count is not used, so
+an answer may have a different number of words than the clue. The search
+explores a bounded number of prefixes (currently 100 million) across all word
+counts and reports if that budget is hit. `dictionary` refuses a multi-word
+anagram because it cannot compose phrases; the two examples above find
+`printout stout yawls` and `wu lisp not statutory`.
+
+`--wordlist` is read best-effort rather than with a strict one-format parser:
+plain text with one entry per line is the canonical form, but CSV/TSV,
+comma/whitespace separated lists, Hunspell-style `word/flags` entries, and JSON
+arrays (or objects containing arrays) of strings all work. UTF-8 with or
+without a BOM and LF/CRLF/CR endings are handled; blank lines and `#` / `//`
+comments are skipped. gzip-compressed and UTF-16 files are rejected with an
+actionable message instead of being read as mojibake, and a leading `~` in the
+path is expanded.
+
+The candidate is the only thing written to stdout, so it can be captured
+directly; diagnostics go to stderr. The exit code is 0 when a candidate is
+found and 1 when the space is exhausted. `--explain` prints the chosen solver
+and its cost estimate before searching, `--dry-run` stops there,
+`--max-candidates` bounds hashed candidates, and the phrase solver also stops
+at its internal prefix budget.
 
 ## Prerequisites
 

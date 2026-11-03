@@ -29,6 +29,7 @@ endif()
 
 set(PROJECT_NAME "HashApp")
 set(HASH_LIBRARY_TARGET "HashLib")
+set(SOLVE_LIBRARY_TARGET "SolveLib")
 set(APP_TARGET "HashApp")
 
 # if this is not set by the user cmake will decide

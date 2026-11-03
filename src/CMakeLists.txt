@@ -1,5 +1,8 @@
 # Hash library
 add_subdirectory(HashLib)
 
-# CLI that links the static library
+# Anagram/preimage search library on top of HashLib
+add_subdirectory(SolveLib)
+
+# CLI that links the static libraries
 add_subdirectory(app)
