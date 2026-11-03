@@ -35,8 +35,8 @@ modern-cmake-app-template/
 │   │       ├── hash_many.cpp               # module hashlib; (padding + lane scheduling)
 │   │       ├── dispatch.cpp                # module hashlib.batch; (CPU detection, best kernel)
 │   │       ├── kernel_sse2.cpp             # module hashlib.batch; 4 lanes
-│   │       ├── kernel_avx2.cpp             # module hashlib.batch; 8 lanes
-│   │       └── kernel_avx512.cpp           # module hashlib.batch; 16 lanes
+│   │       ├── kernel_avx2.cpp             # module hashlib.batch; 8 or 16 lanes
+│   │       └── kernel_avx512.cpp           # module hashlib.batch; 16, 32 or 64 lanes
 │   ├── TimerLib/
 │   │   ├── CMakeLists.txt
 │   │   ├── Timer.cpp                       # module Timer; (stopwatch + duration formatting)
@@ -79,14 +79,16 @@ input, so the choice is purely about the shape of the workload:
 |---|---|---|
 | `hashlib::naive_md5` | yes (`std::vector`) | follows the Wikipedia pseudocode closely; intended for learning and benchmarking |
 | `hashlib::md5_fast` | none, `noexcept` | single message; 64-byte blocks hashed in place, 64 steps expanded at compile time, state kept in registers; 1.3-1.5x the throughput of `naive_md5` with Clang and up to ~3.5x with GCC, because the naive loop is the shape compilers disagree about most (see `docs/md5-optimization.md`) |
-| `hashlib::md5_batch` | none, `noexcept` | many independent messages at once, hashed `lanes` at a time with SSE2, AVX2 or AVX-512F selected at runtime |
+| `hashlib::md5_batch` | none, `noexcept` | many independent messages at once, up to `lanes` per compression with SSE2, AVX2 or AVX-512F selected at runtime; wider kernels interleave two or four independent groups so one group's dependency chain cannot leave the ALUs idle |
 
 MD5 cannot be parallelised *inside* one message: the 64 steps and the block
 chaining are a serial dependency chain. `md5_batch` therefore exploits the other
 axis — independent messages — and is the throughput path for hashing many
 files, records or candidate strings. The batch kernel is selected once from the
 CPU that runs the binary, so a build made on an SSE2-only machine still uses
-AVX2 or AVX-512 on a newer one:
+AVX2 or AVX-512 on a newer one. Each compression hashes up to `lanes` messages;
+`md5_batch` picks the narrowest kernel that covers the call, so a batch of a few
+thousand messages uses 64 at a time on AVX-512 and 16 on AVX2:
 
 ```cpp
 std::vector<std::string> texts = ...;
@@ -98,7 +100,8 @@ for (const std::string& text : texts) {
 hashlib::md5_batch(inputs, digests);
 
 const hashlib::BatchInfo info = hashlib::md5_batch_info();
-// info.isa == "avx512f" / "avx2" / "sse2" / "scalar", info.lanes == 16 / 8 / 4 / 1
+// info.isa == "avx512f" / "avx2" / "sse2" / "scalar"
+// info.lanes is the largest batch one compression can cover: 64 / 16 / 4 / 1
 ```
 
 `HASHLIB_SIMD=OFF` builds a scalar-only library. `HASHLIB_FORCE_ISA` can force
@@ -119,7 +122,7 @@ check:
 HashApp "hello"                  # every implementation, all must agree
 HashApp -a fast "hello"          # just one; -a naive,fast or -a fast -a naive for a subset
 HashApp -a all -b --benchmark-count 100000 "hello"
-HashApp -b --benchmark-batch 16 "hello"   # md5_batch: ns/call and ns/hash
+HashApp -b --benchmark-batch 64 "hello"   # md5_batch: ns/call and ns/hash
 ```
 
 ## Anagram-hash solve mode

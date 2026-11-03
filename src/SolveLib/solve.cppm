@@ -41,6 +41,8 @@ struct SearchProblem {
     std::optional<Anagram> anagram;
     std::optional<Wordlist> wordlist;
     /// Stop after hashing this many candidates. 0 means no limit.
+    /// The limit is checked between hash batches, so a batch in flight can
+    /// still push the count past it.
     std::uint64_t max_candidates = 0;
 };
 
@@ -86,7 +88,10 @@ struct Timing {
     /// Choosing the strategy, including counting wordlist entries for `auto`.
     std::chrono::nanoseconds planning{0};
     /// Building the candidate source: sorting the permutation seed, or opening,
-    /// reading and indexing the wordlist for the phrase solver.
+    /// reading and indexing the wordlist for the phrase solver. The phrase
+    /// solver builds its pair-completion index lazily, on the first node with
+    /// two words left, so some of this number is measured after the search has
+    /// started; it is still indexing, not searching.
     std::chrono::nanoseconds setup{0};
     /// Producing candidates, broken down by what the selected solver spends its
     /// time on.
@@ -110,11 +115,13 @@ struct Counters {
     std::uint64_t fits_passes = 0;
     /// Recursive DFS calls made after pruning.
     std::uint64_t edges = 0;
-    /// Entries into the `words_left == 1` leaf branch.
+    /// Two-word subtrees resolved by the pair-completion index (one lookup
+    /// each). Without two words left this is zero.
     std::uint64_t leaf_visits = 0;
-    /// Bucket entries examined at a leaf.
+    /// Word pairs examined in those subtrees.
     std::uint64_t leaf_candidates = 0;
-    /// Leaf entries whose letter counts matched exactly.
+    /// Word pairs whose letter counts matched exactly. The index only holds
+    /// exact completions, so this equals `leaf_candidates`.
     std::uint64_t same_counts_hits = 0;
     /// Complete phrases handed to the hash batch.
     std::uint64_t phrases_emitted = 0;
@@ -125,7 +132,8 @@ struct Stats {
     std::uint64_t candidates = 0;
     /// Permutations generated, or wordlist entries read (whichever the solver does).
     std::uint64_t scanned = 0;
-    /// Duration of the search loop (excluding planning and setup).
+    /// Duration of the search loop (excluding planning and setup, including
+    /// setup work the phrase solver defers until the search actually needs it).
     std::chrono::nanoseconds elapsed{0};
     /// Per-phase breakdown. Zero in Release builds, where it is not measured.
     Timing timing{};

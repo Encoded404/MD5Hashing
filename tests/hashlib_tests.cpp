@@ -195,7 +195,10 @@ TEST(HashLibTest, Md5BatchReportsKernel) {
     EXPECT_FALSE(info.isa.empty());
     EXPECT_TRUE(info.isa == "avx512f" || info.isa == "avx2" || info.isa == "sse2" ||
                 info.isa == "scalar");
-    EXPECT_TRUE(info.lanes == 1 || info.lanes == 4 || info.lanes == 8 || info.lanes == 16);
+    // One lane per scalar message, or the ISA width times the number of
+    // interleaved groups the kernel hashes per call (4/8/16, 8/16, 16/32/64).
+    EXPECT_TRUE(info.lanes == 1 || info.lanes == 4 || info.lanes == 8 ||
+                info.lanes == 16 || info.lanes == 32 || info.lanes == 64);
 }
 
 TEST(HashLibTest, Md5BatchMatchesSingleForMixedLengths) {

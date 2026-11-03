@@ -16,7 +16,8 @@ namespace hashlib {
 namespace {
 
 constexpr std::size_t kBlockBytes = 64;
-constexpr std::size_t kMaxLanes = 16;
+// The widest kernel the dispatcher can return compresses 64 messages per call.
+constexpr std::size_t kMaxLanes = 64;
 
 void StoreLe64(std::byte* bytes, std::uint64_t value) noexcept {
     if constexpr (std::endian::native == std::endian::big) {
@@ -67,16 +68,30 @@ void PrepareLane(Lane& lane, std::span<const std::byte> input) noexcept {
 // The dispatcher does the CPU detection once; this wrapper caches the choice.
 // A function-local static costs one guard check per md5_batch call (never per
 // block), and is safe if a caller reaches the library during static init.
-const detail::BatchKernel& SelectedKernel() noexcept {
-    static const detail::BatchKernel kernel = detail::SelectBatchKernel();
-    return kernel;
+const detail::KernelSet& SelectedKernels() noexcept {
+    static const detail::KernelSet kernels = detail::SelectBatchKernels();
+    return kernels;
+}
+
+// The narrowest kernel that still covers the batch. One call costs the same as
+// one on a narrower kernel, so covering more messages per call is free; a
+// batch larger than the widest kernel simply takes more calls.
+const detail::BatchKernel& SelectedKernel(std::size_t messages) noexcept {
+    const detail::KernelSet& set = SelectedKernels();
+    for (std::size_t i = 0; i < set.count; ++i) {
+        if (set.kernels[i].lanes >= messages) {
+            return set.kernels[i];
+        }
+    }
+    return set.kernels[set.count - 1];
 }
 
 }  // namespace
 
 BatchInfo md5_batch_info() noexcept {
-    const detail::BatchKernel& kernel = SelectedKernel();
-    return BatchInfo{kernel.name, kernel.lanes};
+    const detail::KernelSet& set = SelectedKernels();
+    const detail::BatchKernel& widest = set.kernels[set.count - 1];
+    return BatchInfo{widest.name, widest.lanes};
 }
 
 void md5_batch(std::span<const std::span<const std::byte>> inputs,
@@ -89,7 +104,7 @@ void md5_batch(std::span<const std::span<const std::byte>> inputs,
         return;
     }
 
-    const detail::BatchKernel& kernel = SelectedKernel();
+    const detail::BatchKernel& kernel = SelectedKernel(inputs.size());
 
     // No SIMD kernel (non-x86 target, HASHLIB_SIMD=OFF, or a forced scalar
     // run), or only one message: batching would add nothing, so use the

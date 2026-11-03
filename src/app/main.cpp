@@ -288,7 +288,7 @@ void BenchmarkBatch(std::span<const std::byte> input, int iterations, int batchS
     const double nanosecondsPerHash = nanosecondsPerCall / static_cast<double>(batchSize);
 
     std::string line = "md5_batch (" + std::string(info.isa) + ", " +
-                       std::to_string(info.lanes) + " lane(s)): " + std::to_string(iterations) +
+                       std::to_string(info.lanes) + " lane(s) max): " + std::to_string(iterations) +
                        " call(s) x " + std::to_string(batchSize) + " hash(es) in " +
                        Timer::FormatDuration(timer.ElapsedDuration()) +
                        ", " +
@@ -609,11 +609,13 @@ int main(int argc, char** argv) {
     app.add_option("--benchmark-count", benchmark_count)
         ->default_val(1000000);
 
-    int benchmark_batch = 16;
+    // 64 fills the widest kernel the dispatcher can return; smaller batches
+    // select a narrower one and would understate the throughput path.
+    int benchmark_batch = 64;
     app.add_option("--benchmark-batch", benchmark_batch,
                    "Messages per md5_batch call in the benchmark (0 disables the batch "
                    "benchmark)")
-        ->default_val(16)
+        ->default_val(64)
         ->check(CLI::NonNegativeNumber)
         ->capture_default_str();
 

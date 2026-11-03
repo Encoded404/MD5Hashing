@@ -27,9 +27,16 @@ struct BatchKernel {
     const char* name = "scalar";
 };
 
-/// Selects the best kernel supported by the CPU executing this process.
+/// The kernels of the widest ISA the CPU supports, narrowest batch first. The
+/// scalar fallback is always present, so `count` is never zero.
+struct KernelSet {
+    std::array<BatchKernel, 3> kernels{};
+    std::size_t count = 0;
+};
+
+/// Selects the kernels supported by the CPU executing this process.
 /// Compiled for the baseline ISA: it must run before any AVX code can.
-[[nodiscard]] BatchKernel SelectBatchKernel() noexcept;
+[[nodiscard]] KernelSet SelectBatchKernels() noexcept;
 
 }  // namespace hashlib::detail
 
@@ -57,6 +64,27 @@ inline constexpr std::uint32_t kRotations[64] = {
     4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
     6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
 };
+
+// The step body below visits the four state words in the order a, d, c, b, and
+// feeds the rounds the message word the RFC names: j in round 1, then
+// (5j + 1) % 16, (3j + 5) % 16 and (7j) % 16. Both are functions of the step
+// index, so the body stays free of run-time indices while being written once
+// for any number of interleaved streams.
+constexpr std::size_t RoleOf(std::size_t step) noexcept { return (4 - step % 4) % 4; }
+
+constexpr std::size_t WordOf(std::size_t step) noexcept {
+    const std::size_t j = step % 16;
+    if (step < 16) {
+        return j;
+    }
+    if (step < 32) {
+        return (5 * j + 1) % 16;
+    }
+    if (step < 48) {
+        return (3 * j + 5) % 16;
+    }
+    return (7 * j) % 16;
+}
 
 // One MD5 step:
 //
@@ -117,116 +145,96 @@ struct TransposeLoader {
     }
 };
 
+// The 64-step fold has to stay inside the kernel. Out of line it becomes a
+// function that receives the state and the schedules by reference, so every
+// value goes through memory and the interleaving gain disappears. `inline`
+// alone is not enough: Clang outlines the four-stream body because of its size.
+#if defined(_MSC_VER) && !defined(__clang__)
+#  define HASHLIB_ALWAYS_INLINE __forceinline
+#else
+#  define HASHLIB_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
+
+// One step of the batch body, applied to every stream. The streams are
+// independent, so their steps can be issued back to back and the processor
+// overlaps the dependency chains instead of waiting on one at a time.
+template <std::size_t I, class Batch, std::size_t Streams>
+HASHLIB_ALWAYS_INLINE void StepAll(Batch (&state)[Streams][4],
+                                   const Batch (&message)[Streams][16]) noexcept {
+    constexpr std::size_t role = RoleOf(I);
+    constexpr std::size_t word = WordOf(I);
+    for (std::size_t stream = 0; stream < Streams; ++stream) {
+        Batch* words = state[stream];
+        words[role] = Step<I>(words[role], words[(role + 1) % 4], words[(role + 2) % 4],
+                              words[(role + 3) % 4], message[stream][word]);
+    }
+}
+
+template <class Batch, std::size_t Streams, std::size_t... I>
+HASHLIB_ALWAYS_INLINE void Steps(Batch (&state)[Streams][4],
+                                 const Batch (&message)[Streams][16],
+                                 std::index_sequence<I...>) noexcept {
+    (StepAll<I>(state, message), ...);
+}
+
+#undef HASHLIB_ALWAYS_INLINE
+
 // Compress one 64-byte block from every lane into the interleaved state:
-// a[lanes], b[lanes], c[lanes], d[lanes]. A kernel whose best transpose is
-// ISA-specific passes its own loader as the second template argument; the
+// a[lanes], b[lanes], c[lanes], d[lanes], where lanes = Streams * Batch::size.
+//
+// The call carries Streams independent groups: group s owns lanes
+// [s*N, s*N + N) and the blocks[s*N .. s*N + N). The groups never interact, so
+// the digests are identical to hashing each group in its own call. What changes
+// is the schedule: one group's dependency chain leaves the vector ALUs idle,
+// and the other groups fill that time. A kernel whose best transpose is
+// ISA-specific passes its own loader as the third template argument; the
 // 64-step body stays shared.
-template <class Batch, class Loader = TransposeLoader<Batch>>
+template <class Batch, std::size_t Streams = 1, class Loader = TransposeLoader<Batch>>
 inline void CompressBlock(const std::byte* const* blocks, std::uint32_t* state,
                           Loader load = {}) noexcept {
     constexpr std::size_t N = Batch::size;
+    constexpr std::size_t L = Streams * N;
+    static_assert(Streams > 0, "a batch needs at least one stream");
 
-    Batch a = Batch::load_unaligned(state + 0 * N);
-    Batch b = Batch::load_unaligned(state + 1 * N);
-    Batch c = Batch::load_unaligned(state + 2 * N);
-    Batch d = Batch::load_unaligned(state + 3 * N);
+    Batch w[Streams][4];
+    Batch m[Streams][16];
 
-    Batch m[16];
-    load(blocks, m);
+    for (std::size_t stream = 0; stream < Streams; ++stream) {
+        for (std::size_t role = 0; role < 4; ++role) {
+            w[stream][role] = Batch::load_unaligned(state + role * L + stream * N);
+        }
+        load(blocks + stream * N, m[stream]);
+    }
 
-    const Batch a0 = a;
-    const Batch b0 = b;
-    const Batch c0 = c;
-    const Batch d0 = d;
+    Batch initial[Streams][4];
+    for (std::size_t stream = 0; stream < Streams; ++stream) {
+        for (std::size_t role = 0; role < 4; ++role) {
+            initial[stream][role] = w[stream][role];
+        }
+    }
 
-    // Round 1: F(x, y, z) = z ^ (x & (y ^ z)); words 0..15 in order.
-    a = Step<0>(a, b, c, d, m[0]);
-    d = Step<1>(d, a, b, c, m[1]);
-    c = Step<2>(c, d, a, b, m[2]);
-    b = Step<3>(b, c, d, a, m[3]);
-    a = Step<4>(a, b, c, d, m[4]);
-    d = Step<5>(d, a, b, c, m[5]);
-    c = Step<6>(c, d, a, b, m[6]);
-    b = Step<7>(b, c, d, a, m[7]);
-    a = Step<8>(a, b, c, d, m[8]);
-    d = Step<9>(d, a, b, c, m[9]);
-    c = Step<10>(c, d, a, b, m[10]);
-    b = Step<11>(b, c, d, a, m[11]);
-    a = Step<12>(a, b, c, d, m[12]);
-    d = Step<13>(d, a, b, c, m[13]);
-    c = Step<14>(c, d, a, b, m[14]);
-    b = Step<15>(b, c, d, a, m[15]);
+    Steps(w, m, std::make_index_sequence<64>{});
 
-    // Round 2: G(x, y, z) = y ^ (z & (x ^ y)); word (5 * step + 1) % 16.
-    a = Step<16>(a, b, c, d, m[1]);
-    d = Step<17>(d, a, b, c, m[6]);
-    c = Step<18>(c, d, a, b, m[11]);
-    b = Step<19>(b, c, d, a, m[0]);
-    a = Step<20>(a, b, c, d, m[5]);
-    d = Step<21>(d, a, b, c, m[10]);
-    c = Step<22>(c, d, a, b, m[15]);
-    b = Step<23>(b, c, d, a, m[4]);
-    a = Step<24>(a, b, c, d, m[9]);
-    d = Step<25>(d, a, b, c, m[14]);
-    c = Step<26>(c, d, a, b, m[3]);
-    b = Step<27>(b, c, d, a, m[8]);
-    a = Step<28>(a, b, c, d, m[13]);
-    d = Step<29>(d, a, b, c, m[2]);
-    c = Step<30>(c, d, a, b, m[7]);
-    b = Step<31>(b, c, d, a, m[12]);
-
-    // Round 3: H(x, y, z) = x ^ y ^ z; word (3 * step + 5) % 16.
-    a = Step<32>(a, b, c, d, m[5]);
-    d = Step<33>(d, a, b, c, m[8]);
-    c = Step<34>(c, d, a, b, m[11]);
-    b = Step<35>(b, c, d, a, m[14]);
-    a = Step<36>(a, b, c, d, m[1]);
-    d = Step<37>(d, a, b, c, m[4]);
-    c = Step<38>(c, d, a, b, m[7]);
-    b = Step<39>(b, c, d, a, m[10]);
-    a = Step<40>(a, b, c, d, m[13]);
-    d = Step<41>(d, a, b, c, m[0]);
-    c = Step<42>(c, d, a, b, m[3]);
-    b = Step<43>(b, c, d, a, m[6]);
-    a = Step<44>(a, b, c, d, m[9]);
-    d = Step<45>(d, a, b, c, m[12]);
-    c = Step<46>(c, d, a, b, m[15]);
-    b = Step<47>(b, c, d, a, m[2]);
-
-    // Round 4: I(x, y, z) = y ^ (x | ~z); word (7 * step) % 16.
-    a = Step<48>(a, b, c, d, m[0]);
-    d = Step<49>(d, a, b, c, m[7]);
-    c = Step<50>(c, d, a, b, m[14]);
-    b = Step<51>(b, c, d, a, m[5]);
-    a = Step<52>(a, b, c, d, m[12]);
-    d = Step<53>(d, a, b, c, m[3]);
-    c = Step<54>(c, d, a, b, m[10]);
-    b = Step<55>(b, c, d, a, m[1]);
-    a = Step<56>(a, b, c, d, m[8]);
-    d = Step<57>(d, a, b, c, m[15]);
-    c = Step<58>(c, d, a, b, m[6]);
-    b = Step<59>(b, c, d, a, m[13]);
-    a = Step<60>(a, b, c, d, m[4]);
-    d = Step<61>(d, a, b, c, m[11]);
-    c = Step<62>(c, d, a, b, m[2]);
-    b = Step<63>(b, c, d, a, m[9]);
-
-    a += a0;
-    b += b0;
-    c += c0;
-    d += d0;
-
-    a.store_unaligned(state + 0 * N);
-    b.store_unaligned(state + 1 * N);
-    c.store_unaligned(state + 2 * N);
-    d.store_unaligned(state + 3 * N);
+    for (std::size_t stream = 0; stream < Streams; ++stream) {
+        for (std::size_t role = 0; role < 4; ++role) {
+            w[stream][role] += initial[stream][role];
+            w[stream][role].store_unaligned(state + role * L + stream * N);
+        }
+    }
 }
 
 // Kernel entry points. Definitions live in the per-ISA implementation units;
-// the dispatcher takes their addresses. Declaring all three unconditionally
+// the dispatcher takes their addresses. Declaring all of them unconditionally
 // keeps this interface free of build-configuration #if blocks.
+//
+// The suffix is the stream count: `x2` interleaves two groups of batches, so it
+// hashes twice as many messages per call, `x4` four. The number of lanes is the
+// ISA width times that count.
 void CompressSse2(const std::byte* const* blocks, std::uint32_t* state) noexcept;
 void CompressAvx2(const std::byte* const* blocks, std::uint32_t* state) noexcept;
+void CompressAvx2x2(const std::byte* const* blocks, std::uint32_t* state) noexcept;
 void CompressAvx512(const std::byte* const* blocks, std::uint32_t* state) noexcept;
+void CompressAvx512x2(const std::byte* const* blocks, std::uint32_t* state) noexcept;
+void CompressAvx512x4(const std::byte* const* blocks, std::uint32_t* state) noexcept;
 
 }  // namespace hashlib::detail

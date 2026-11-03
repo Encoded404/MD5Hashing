@@ -77,50 +77,76 @@ struct Entry {
     CompressFn compress;
     std::size_t lanes;
     const char* name;
+    std::size_t isa;  // entries of one ISA are contiguous and share a name
 };
 
-// Best first. Add a new ISA by adding a kernel TU, a declaration in
-// batch.cppm, and an entry here.
+// Best first: widest ISA, then widest stream count. Selection never trades ISA
+// width for a smaller batch, because a narrower ISA needs more calls for the
+// same work. Add a stream count by adding a kernel TU, a declaration in
+// batch.cppm, and a row here next to the others of its ISA.
 constexpr Entry kEntries[] = {
 #if defined(HASHLIB_WITH_AVX512)
-    {&HaveAvx512F, &CompressAvx512, 16, "avx512f"},
+    {&HaveAvx512F, &CompressAvx512x4, 64, "avx512f", 0},
+    {&HaveAvx512F, &CompressAvx512x2, 32, "avx512f", 0},
+    {&HaveAvx512F, &CompressAvx512, 16, "avx512f", 0},
 #endif
 #if defined(HASHLIB_WITH_AVX2)
-    {&HaveAvx2, &CompressAvx2, 8, "avx2"},
+    {&HaveAvx2, &CompressAvx2x2, 16, "avx2", 1},
+    {&HaveAvx2, &CompressAvx2, 8, "avx2", 1},
 #endif
 #if defined(HASHLIB_X86)
-    {[]() noexcept { return true; }, &CompressSse2, 4, "sse2"},
+    {[]() noexcept { return true; }, &CompressSse2, 4, "sse2", 2},
 #endif
-    {nullptr, nullptr, 1, "scalar"},
+    {nullptr, nullptr, 1, "scalar", 3},
 };
 
 }  // namespace
 
-BatchKernel SelectBatchKernel() noexcept {
+KernelSet SelectBatchKernels() noexcept {
 #if defined(HASHLIB_X86) && (defined(__clang__) || defined(__GNUC__))
     // Safe even if a caller reaches the library during static initialisation,
     // before the runtime's own CPU-feature constructor has run.
     __builtin_cpu_init();
 #endif
 
-    // Test hook: force one kernel so every path can be exercised on one
-    // machine. Unknown names (or an unavailable ISA) fall through to scalar.
+    // Test hook: force one ISA so every path can be exercised on one machine.
+    // Unknown names (or an unavailable ISA) fall through to scalar.
     const char* forced = std::getenv("HASHLIB_FORCE_ISA");
     const std::string_view forcedName =
         forced != nullptr ? std::string_view{forced} : std::string_view{};
 
+    const Entry* first = nullptr;
     for (const Entry& entry : kEntries) {
         if (entry.compress == nullptr) {
-            break;
+            break;  // the scalar terminator is the fallback, never forced
         }
-        if (forcedName.empty() || forcedName == entry.name) {
-            if (entry.supported()) {
-                return BatchKernel{entry.compress, entry.lanes, entry.name};
-            }
+        if (!forcedName.empty() && forcedName != entry.name) {
+            continue;
+        }
+        if (entry.supported()) {
+            first = &entry;
+            break;
         }
     }
 
-    return BatchKernel{};
+    KernelSet set;
+    set.kernels[0] = BatchKernel{};  // scalar: the caller falls back to md5_fast
+    set.count = 1;
+    if (first == nullptr) {
+        return set;
+    }
+
+    // Collect the whole ISA group (the table is widest-first) and reverse it so
+    // callers can pick the narrowest kernel that still covers their batch.
+    std::size_t count = 0;
+    for (const Entry* entry = first;
+         entry->compress != nullptr && entry->isa == first->isa &&
+         count < set.kernels.size(); ++entry) {
+        set.kernels[count++] = BatchKernel{entry->compress, entry->lanes, entry->name};
+    }
+    std::reverse(set.kernels.begin(), set.kernels.begin() + static_cast<std::ptrdiff_t>(count));
+    set.count = count;
+    return set;
 }
 
 }  // namespace hashlib::detail

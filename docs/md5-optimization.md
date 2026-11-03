@@ -140,15 +140,18 @@ it has no 32-bit rotate; AVX2 has none either.
 
 SIMD only helps when independent messages are batched into lanes: four with
 SSE2, eight with AVX2, sixteen with AVX-512. That needs a different API, not a
-faster single-message `md5(span)`.
+faster single-message `md5(span)`. The lanes supply the width; interleaving
+several such groups supplies independent chains for the processor to overlap.
 
 ### `md5_batch`: one kernel per ISA, chosen at runtime
 
-`hashlib::md5_batch` is that API. It hashes `lanes` independent messages per
-compression, with `lanes` = 4 (SSE2), 8 (AVX2), 16 (AVX-512F), or 1 (scalar).
-Each message is padded independently, so lengths may differ; lanes that finish
-early are fed zero blocks and their digest is captured right after their own
-last block.
+`hashlib::md5_batch` is that API. One compression covers up to `lanes`
+independent messages: 4 (SSE2), 8 or 16 (AVX2), 16, 32 or 64 (AVX-512F), or 1
+(scalar). The dispatcher hands over every kernel of the widest ISA and
+`md5_batch` picks the narrowest one that still covers the call, so a large batch
+is hashed 64 at a time on AVX-512 and 16 at a time on AVX2. Each message is
+padded independently, so lengths may differ; lanes that finish early are fed
+zero blocks and their digest is captured right after their own last block.
 
 The batch subsystem is one internal module plus the implementation units around
 it:
@@ -177,12 +180,18 @@ needs. The only textual include left is third-party `xsimd` in each kernel's
 global module fragment, because xsimd selects its architecture from
 `__AVX2__`/`__AVX512F__` at include time.
 
-The 64 steps are written as four explicit rounds with the canonical
-`a`/`d`/`c`/`b` role rotation. Each call names its message word directly, so
-there is no runtime message index and no role-selection table, and the
-compression function's state words are locals rather than references into a
-caller's stack frame. Clang keeps them in registers for the whole block; the
-only state stores are the four at the end.
+The 64 steps are one body shared by every ISA and every group count. The step
+index fixes both the role (`a`, `d`, `c`, `b`) and the message word (`j`,
+`(5j + 1) % 16`, `(3j + 5) % 16`, `(7j) % 16`), so `RoleOf()` and `WordOf()` are
+`constexpr`, there is no runtime index and no role-selection table, and the
+state words are locals rather than references into a caller's stack frame. The
+body is a fold over `std::index_sequence<64>` rather than 64 written-out calls:
+that is what lets the same source compress one, two or four interleaved groups
+without a second copy of the algorithm. The fold and the per-step helper are
+forced inline; an out-of-line 64-step body receives the state and the schedules
+by reference, which pushes every value through memory and removes the
+interleaving gain entirely (measured: the outlined four-group kernel was 1.8x
+slower per call than the inlined one).
 
 This is what makes a build on an SSE2-only machine useful: the compiler can
 emit AVX2/AVX-512 code without the build host supporting it, and the selection
@@ -194,11 +203,44 @@ The 16-lane kernel transposes with four 8×8 AVX2 transposes (xsimd 13's
 32-bit AVX-512 transpose is a scalar scratch-buffer fallback) and joins each
 pair with `vinserti64x4`. On AVX2 the 16 schedule vectors plus four state
 vectors exceed the 16 `ymm` registers, so the compiler reloads or moves parts
-of the schedule during the rounds; AVX-512 has 32 `zmm` registers and fits the
-whole working set.
+of the schedule during the rounds; one AVX-512 group fits the whole working set
+in 32 `zmm` registers. Two groups need 40 vectors and four need 80, so the
+compiler spills the schedules to the stack and reloads them as memory operands.
+That is cheap enough to be invisible here (a variant that forces the schedules
+into memory measures the same), but it is why the four-group kernel is 2500
+instructions.
+
+#### Interleaving independent groups
+
+A block's 64 steps are a chain: `vpternlogd`, `vpaddd`, `vprold`, `vpaddd`, each
+waiting on the one before. On Zen 5 a 512-bit vector operation takes about two
+cycles, so a step costs ~8 cycles while only ~5 uops issue: the vector ALUs are
+less than half busy. A second independent group of messages fills the idle
+slots, which is why `CompressBlock<Batch, Streams>` takes `Streams` groups per
+call. The groups own disjoint lane ranges and never interact, so the digests are
+identical to hashing them in separate calls.
+
+Kernel only, one block per message, Clang 21, `-O3 -march=x86-64 -mavx2
+-mavx512f`, pinned, best of five:
+
+| kernel | ns/call | messages/call | ns/hash |
+|---|---|---|---|
+| AVX-512, 1 group | 136.6 | 16 | 8.54 |
+| AVX-512, 2 groups | 138.0 | 32 | 4.31 |
+| AVX-512, 4 groups | 205.1 | 64 | 3.20 |
+| AVX2, 1 group | 115.0 | 8 | 14.39 |
+| AVX2, 2 groups | 116.0 | 16 | 7.23 |
+
+Two groups cost about 1% more wall time than one and do twice the work. Four
+groups are past the point where the chain matters and are limited by the vector
+ALUs instead, which still buys another 34%. The two-group AVX2 kernel reaches
+the one-group AVX-512 throughput, which is the same effect from the other
+direction: the number of independent chains matters, not the lane width.
 
 Measured on an i5-1250P (AVX2, no AVX-512), Clang 21 + libc++, baseline
-`-march=x86-64` build, 43-byte text:
+`-march=x86-64` build, 43-byte text. These predate the interleaved kernels: the
+8-message row still selects the single-group kernel, while the larger batches
+now use two groups:
 
 | path | ns/call | ns/hash | GB/s |
 |---|---|---|---|
@@ -224,8 +266,9 @@ because this CPU has no AVX-512. `HASHLIB_FORCE_ISA=sse2|avx2|avx512f|scalar`
 exercises each available kernel on one machine; Intel SDE or a Zen 4/5 runner
 is needed to execute the AVX-512 path.
 
-Re-measured on the Zen 5 machine (AVX-512), `HashApp -b --benchmark-batch 16`,
-`md5_batch` against `md5_fast` on the same build:
+Re-measured on the Zen 5 machine (AVX-512), `HashApp -b --benchmark-batch 16`
+(which selects the single-group kernel), `md5_batch` against `md5_fast` on the
+same build:
 
 | message | `md5_fast` GB/s | `md5_batch` GB/s | speed-up |
 |---|---|---|---|
@@ -235,17 +278,33 @@ Re-measured on the Zen 5 machine (AVX-512), `HashApp -b --benchmark-batch 16`,
 | 64 KiB | 1.10 | 7.16 | 6.5x |
 | 100 KB | 1.10 | 7.31 | 6.6x |
 
-Forced kernels at 4 KiB show the scaling is linear in lanes, so the kernel is
-not the limit: sse2 (4 lanes) 1.54, avx2 (8 lanes) 3.60, avx512f (16 lanes) 7.02,
-scalar (1 lane) 1.07 GB/s.
+Forced kernels at 4 KiB, one group each: sse2 (4 lanes) 1.54, avx2 (8 lanes)
+3.60, avx512f (16 lanes) 7.02, scalar (1 lane) 1.07 GB/s. That scaling is linear
+in lanes because the step chain, not the ALUs, sets the time per call — the same
+observation that makes a second group nearly free.
+
+With the interleaved kernels the same `HashApp -b` run, by batch size:
+
+| messages/call | kernel | 43 B ns/hash | 4 KiB ns/hash |
+|---|---|---|---|
+| 16 | AVX-512, 1 group | 12.4 | 577 |
+| 32 | AVX-512, 2 groups | 7.8 | 315 |
+| 64 | AVX-512, 4 groups | 6.3 | 227 |
+
+At 43 B the per-message padding and bookkeeping do not shrink with the kernel,
+so the call gains 1.6x at 32 messages and 2.0x at 64; at 4 KiB the kernel
+dominates and the four-group kernel is 2.5x the one-group one. Batches larger
+than 64 keep the same per-message cost (2.2x at 64 KiB), because they simply
+take more calls.
 
 A step is `vpternlogd`, `vpaddd`, `vprold`, `vpaddd`, and Zen 5 vector ALU
 operations measure 2 cycles each (the GPR `add`/`rol` path is 1), so one step is
-8 cycles and one block of 16 messages is 512 cycles: a bound of 2 bytes per
-cycle, or 11 GB/s at 5.5 GHz. 7.02 GB/s is 1.27 bytes per cycle, about 64% of
-that. The missing third is the per-block transpose and the per-lane pointer and
-digest bookkeeping in `hash_many.cpp`, both of which scale with lanes and blocks
-rather than with bytes.
+8 cycles and one block of 16 messages is 512 cycles: 2 bytes per cycle, or
+11 GB/s at 5.5 GHz. That is a latency bound, not a throughput bound — the ALUs
+are less than half busy — which is exactly why the extra groups work. 7.02 GB/s
+was 1.27 bytes per cycle, about 64% of the one-group bound; the missing third is
+the per-block transpose and the per-lane pointer and digest bookkeeping in
+`hash_many.cpp`, which scale with lanes and blocks rather than with bytes.
 
 ## Compiler flags
 

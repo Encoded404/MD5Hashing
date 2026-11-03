@@ -35,11 +35,13 @@ using Digest = std::array<std::byte, 16>;
 /// Not a streaming API.
 [[nodiscard]] Digest md5_fast(std::span<const std::byte> input) noexcept;
 
-/// Which batch kernel the runtime selected, and how many independent messages
-/// it hashes per compression. `isa` is one of "avx512f", "avx2", "sse2" or
-/// "scalar". Selection happens once, on first use, from the CPU executing the
-/// process, so one binary can use the best instructions available on any
-/// x86-64 machine it is run on.
+/// Which batch kernel the runtime selected, and the largest number of
+/// independent messages one compression can cover. `isa` is one of
+/// "avx512f", "avx2", "sse2" or "scalar". Selection happens once, on first use,
+/// from the CPU executing the process, so one binary can use the best
+/// instructions available on any x86-64 machine it is run on. Kernels that
+/// interleave several independent groups report the total, and `md5_batch`
+/// picks whichever of them covers the batch in the fewest calls.
 struct BatchInfo {
     std::string_view isa;
     std::size_t lanes;
@@ -51,10 +53,10 @@ struct BatchInfo {
 /// Computes the MD5 digest of every input using the widest SIMD kernel the
 /// running CPU supports.
 ///
-/// The inputs are hashed `lanes` at a time (see `md5_batch_info()`), with lanes
-/// that have no input padded out and their results discarded. Inputs may have
-/// different lengths; each lane is padded independently. The caller owns the
-/// output storage and must provide at least `inputs.size()` entries.
+/// The inputs are hashed up to `lanes` at a time (see `md5_batch_info()`), with
+/// lanes that have no input padded out and their results discarded. Inputs may
+/// have different lengths; each lane is padded independently. The caller owns
+/// the output storage and must provide at least `inputs.size()` entries.
 ///
 /// This is the throughput-oriented entry point: it is fastest when many
 /// independent messages are hashed together. For a single message use

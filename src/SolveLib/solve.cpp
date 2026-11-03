@@ -7,11 +7,40 @@ import Timer;
 namespace {
 
 constexpr std::size_t kBatchSize = 64;
+// The phrase solver's batch only feeds `md5_batch`; it is larger than the
+// generic one so the per-batch bookkeeping (and its timing reads) is amortised
+// over more candidates. The candidate budget is still enforced per phrase, so
+// a batch can overshoot it by at most this many candidates.
+constexpr std::size_t kPhraseBatchSize = 256;
 constexpr std::size_t kMaxPhraseUnique = 32;
 constexpr std::size_t kMaxPhraseWords = solve::kMaxPhraseWords;
 constexpr std::uint8_t kNoIndex = 0xFF;
 constexpr std::uint64_t kPhraseNodeBudget = 100'000'000;
 constexpr std::uint64_t kMaxU64 = std::numeric_limits<std::uint64_t>::max();
+// Above this many mixed-radix states the flat leaf index costs too much memory;
+// the unordered_map fallback is used instead.
+constexpr std::uint64_t kFlatKeyLimit = 1'000'000;
+// The pair memo trades an O(words^2) setup pass for removing the last two DFS
+// levels. These caps keep that pass (and its memory) bounded on pathological
+// wordlists; past them the plain DFS runs instead.
+constexpr std::size_t kPairMemoWordLimit = 4096;
+constexpr std::size_t kPairMemoEntryLimit = 4'000'000;
+// Phrase emission copies words with a constant-size move so the compiler emits
+// a load/store pair instead of calling memcpy for every word. The store may run
+// past the phrase; the batch slot reserves kSlotSlack bytes for that.
+constexpr std::size_t kWordCopyBytes = 16;
+constexpr std::size_t kPrefixCopyBytes = 32;
+constexpr std::size_t kSlotSlack = kPrefixCopyBytes;
+// The pair memo packs one letter count into five bits of a 64-bit word. Twelve
+// letters fit, and counts up to seven keep the packed addition carry-free.
+constexpr std::size_t kPackedPhraseLetters = 12;
+constexpr std::uint64_t kPhraseFieldHigh = [] {
+    std::uint64_t mask = 0;
+    for (std::size_t i = 0; i < kPackedPhraseLetters; ++i) {
+        mask |= std::uint64_t{1} << (5 * i + 4);
+    }
+    return mask;
+}();
 
 #if defined(SOLVE_TIMING) && SOLVE_TIMING
 constexpr bool kTimingEnabled = true;
@@ -306,6 +335,27 @@ struct PhraseWord {
     std::string text;
     std::array<std::uint16_t, kMaxPhraseUnique> counts{};
     std::uint64_t key = 0;
+    /// Bits of the letters present in `text`, for one-AND exhaustion checks.
+    std::uint64_t mask = 0;
+    /// The first kWordCopyBytes characters of `text`, zero-padded, so emitting a
+    /// phrase is a constant-size store rather than a memcpy call.
+    std::array<char, kWordCopyBytes> head{};
+};
+
+/// Two words that together use exactly the letters of one mixed-radix state.
+/// The memo of these lists turns the bottom two levels of the DFS into a table
+/// lookup: for a remaining key, every completion is already enumerated.
+struct PhrasePair {
+    std::uint32_t first = 0;
+    std::uint32_t second = 0;
+};
+
+/// The part of a word that phrase writing needs, kept in a small array of its
+/// own. The memo path picks words at random; walking these 20-byte records keeps
+/// those accesses in L1 instead of touching the 120-byte `PhraseWord` records.
+struct WordEmit {
+    std::array<char, kWordCopyBytes> head{};
+    std::uint32_t size = 0;
 };
 
 class PhraseSearch {
@@ -313,7 +363,7 @@ public:
     PhraseSearch(const solve::SearchProblem& problem, std::string_view phrase,
                  Timer::Timer& setup_timer, solve::Timing& timing, solve::Counters& counters)
         : target_(problem.target.digest), max_candidates_(problem.max_candidates),
-          timing_(&timing), counters_(&counters) {
+          timing_(&timing), counters_(&counters), setup_timer_(&setup_timer) {
         [[maybe_unused]] const Timer::ScopedTimer setup(setup_timer, kTimingEnabled);
         if (!problem.wordlist) {
             error_ = "the phrase solver requires a wordlist (--wordlist)";
@@ -348,6 +398,8 @@ public:
             }
             ++target_counts_[index];
         }
+
+        full_mask_ = (std::uint64_t{1} << unique_count_) - 1;
 
         std::uint64_t stride = 1;
         for (std::size_t i = 0; i < unique_count_; ++i) {
@@ -389,6 +441,7 @@ public:
                     break;
                 }
                 ++word.counts[index];
+                word.mask |= std::uint64_t{1} << index;
                 if (word.counts[index] > target_counts_[index]) {
                     fits = false;
                     break;
@@ -399,6 +452,8 @@ public:
             }
 
             word.text = token;
+            const std::size_t head_bytes = std::min(token.size(), kWordCopyBytes);
+            std::memcpy(word.head.data(), token.data(), head_bytes);
             for (std::size_t i = 0; i < unique_count_; ++i) {
                 word.key += static_cast<std::uint64_t>(word.counts[i]) * strides_[i];
             }
@@ -419,12 +474,37 @@ public:
 
         max_word_length_ = words_.front().text.size();
         min_word_length_ = words_.back().text.size();
+        // Emission records in the same order as words_, so the pair memo can
+        // name a word by its index and still write it from a compact array.
+        emit_words_.resize(words_.size());
         for (std::size_t i = 0; i < words_.size(); ++i) {
-            by_key_[words_[i].key].push_back(static_cast<std::uint32_t>(i));
+            emit_words_[i].head = words_[i].head;
+            emit_words_[i].size = static_cast<std::uint32_t>(words_[i].text.size());
+        }
+        if (state_count_ <= kFlatKeyLimit) {
+            flat_keys_ = true;
+            key_offsets_.assign(static_cast<std::size_t>(state_count_) + 1, 0);
+            for (const PhraseWord& word : words_) {
+                ++key_offsets_[static_cast<std::size_t>(word.key) + 1];
+            }
+            for (std::size_t i = 1; i < key_offsets_.size(); ++i) {
+                key_offsets_[i] += key_offsets_[i - 1];
+            }
+            key_entries_.resize(words_.size());
+            std::vector<std::uint32_t> cursor(key_offsets_.begin(), key_offsets_.end() - 1);
+            for (std::size_t i = 0; i < words_.size(); ++i) {
+                const std::size_t key = static_cast<std::size_t>(words_[i].key);
+                key_entries_[cursor[key]++] = static_cast<std::uint32_t>(i);
+            }
+        } else {
+            for (std::size_t i = 0; i < words_.size(); ++i) {
+                by_key_[words_[i].key].push_back(static_cast<std::uint32_t>(i));
+            }
         }
 
         remaining_counts_ = target_counts_;
         remaining_length_ = total_letters_;
+        remaining_mask_ = full_mask_;
     }
 
     solve::Outcome Run() {
@@ -440,29 +520,37 @@ public:
             return outcome;
         }
 
-        prefix_.reserve(total_letters_ + max_words_ - 1);
+        phrase_buffer_.resize(total_letters_ + max_words_ - 1 + kSlotSlack);
+        batch_stride_ = total_letters_ + max_words_ - 1 + kSlotSlack;
+        batch_storage_.resize(kPhraseBatchSize * batch_stride_);
         Timer::Timer search_timer(true);
+        // The lazy pair memo advances `setup_timer_` in the middle of a pass, so
+        // its growth has to come out of the level timers exactly like the other
+        // nested phases. `setup_at_start` also keeps the constructor's own setup
+        // time out of the subtraction.
+        [[maybe_unused]] const std::chrono::nanoseconds setup_at_start =
+            kTimingEnabled ? setup_timer_->ElapsedDuration() : std::chrono::nanoseconds{0};
+        // Everything measured inside the traversal: hashing, comparison, span
+        // preparation, and any setup work performed on demand.
+        [[maybe_unused]] const auto inner = [this, setup_at_start] {
+            return timing_->generate.prepare + timing_->hash + timing_->match +
+                   (setup_timer_->ElapsedDuration() - setup_at_start);
+        };
         DfsResult result = DfsResult::exhausted;
         for (std::size_t words = 2; words <= max_words_; ++words) {
             remaining_counts_ = target_counts_;
             remaining_length_ = total_letters_;
-            prefix_.clear();
-            [[maybe_unused]] const std::chrono::nanoseconds hash_before =
-                hash_timer_.ElapsedDuration();
-            [[maybe_unused]] const std::chrono::nanoseconds match_before =
-                match_timer_.ElapsedDuration();
-            [[maybe_unused]] const std::chrono::nanoseconds prepare_before =
-                timing_->generate.prepare;
+            remaining_mask_ = full_mask_;
+            [[maybe_unused]] const std::chrono::nanoseconds nested_before =
+                kTimingEnabled ? inner() : std::chrono::nanoseconds{0};
             Timer::Timer level_timer(kTimingEnabled);
-            result = dfs(words, target_key_);
+            result = dfs(words, target_key_, 0);
             level_timer.Stop();
             if constexpr (kTimingEnabled) {
-                // The level timer includes hash/match/prepare; take those out
-                // so the per-depth values add up to `generate.dfs`.
-                const std::chrono::nanoseconds nested =
-                    (hash_timer_.ElapsedDuration() - hash_before) +
-                    (match_timer_.ElapsedDuration() - match_before) +
-                    (timing_->generate.prepare - prepare_before);
+                // The level timer includes hash/match/prepare and on-demand
+                // setup; take those out so the per-depth values add up to
+                // `generate.dfs`.
+                const std::chrono::nanoseconds nested = inner() - nested_before;
                 const std::chrono::nanoseconds level_total = level_timer.ElapsedDuration();
                 timing_->generate.dfs_by_word_count[words - 2] +=
                     level_total > nested ? level_total - nested
@@ -479,20 +567,23 @@ public:
             }
         }
         search_timer.Stop();
+        // `Stats::elapsed` is documented as the search loop excluding setup, and
+        // the other solvers get that for free because their setup finishes
+        // before `search_timer` starts. The pair memo is setup performed inside
+        // the loop, so take its measured cost back out.
         const std::chrono::nanoseconds search_elapsed = search_timer.ElapsedDuration();
-        outcome.stats = solve::Stats{hashed_, nodes_, search_elapsed};
+        const std::chrono::nanoseconds elapsed =
+            search_elapsed > lazy_setup_ ? search_elapsed - lazy_setup_
+                                         : std::chrono::nanoseconds{0};
+        outcome.stats = solve::Stats{hashed_, nodes_, elapsed};
         if constexpr (kTimingEnabled) {
-            const std::chrono::nanoseconds hash_elapsed = hash_timer_.ElapsedDuration();
-            const std::chrono::nanoseconds match_elapsed = match_timer_.ElapsedDuration();
             // Hashing, comparison and span preparation happen inside the DFS
-            // (flush), so the traversal is the search time minus those nested
-            // phases.
+            // (flush), so the traversal is the search duration minus those
+            // nested phases. On-demand setup is already out of `elapsed`.
             const std::chrono::nanoseconds nested =
-                hash_elapsed + match_elapsed + timing_->generate.prepare;
+                timing_->hash + timing_->match + timing_->generate.prepare;
             timing_->generate.dfs =
-                search_elapsed > nested ? search_elapsed - nested : std::chrono::nanoseconds{0};
-            timing_->hash = hash_elapsed;
-            timing_->match = match_elapsed;
+                elapsed > nested ? elapsed - nested : std::chrono::nanoseconds{0};
         }
 
         switch (result) {
@@ -543,7 +634,13 @@ private:
     }
 
     [[nodiscard]] bool Fits(const PhraseWord& word) const {
-        for (std::size_t i = 0; i < unique_count_; ++i) {
+        // The caller's length window already guarantees the word is not too
+        // long; this rejects exhausted letters before the count scan.
+        if ((word.mask & ~remaining_mask_) != 0) {
+            return false;
+        }
+        for (std::uint64_t bits = word.mask; bits != 0; bits &= bits - 1) {
+            const std::size_t i = static_cast<std::size_t>(std::countr_zero(bits));
             if (word.counts[i] > remaining_counts_[i]) {
                 return false;
             }
@@ -561,29 +658,283 @@ private:
     }
 
     void Subtract(const PhraseWord& word) {
-        for (std::size_t i = 0; i < unique_count_; ++i) {
+        for (std::uint64_t bits = word.mask; bits != 0; bits &= bits - 1) {
+            const std::size_t i = static_cast<std::size_t>(std::countr_zero(bits));
             remaining_counts_[i] -= word.counts[i];
+            if (remaining_counts_[i] == 0) {
+                remaining_mask_ &= ~(std::uint64_t{1} << i);
+            }
         }
         remaining_length_ -= word.text.size();
     }
 
     void Add(const PhraseWord& word) {
-        for (std::size_t i = 0; i < unique_count_; ++i) {
+        for (std::uint64_t bits = word.mask; bits != 0; bits &= bits - 1) {
+            const std::size_t i = static_cast<std::size_t>(std::countr_zero(bits));
             remaining_counts_[i] += word.counts[i];
         }
+        // Every letter in the word is present again after adding it back.
+        remaining_mask_ |= word.mask;
         remaining_length_ += word.text.size();
     }
 
-    DfsResult add_phrase() {
+    /// Copies `word` into `dst` with a constant-size move; `dst` must be
+    /// followed by at least kWordCopyBytes of writable space.
+    static void copy_word(char* dst, const PhraseWord& word) {
+        if (word.text.size() <= kWordCopyBytes) {
+            std::memcpy(dst, word.head.data(), kWordCopyBytes);
+        } else {
+            std::memcpy(dst, word.text.data(), word.text.size());
+        }
+    }
+
+    /// Same idea for the composed prefix, which can be a few words long.
+    static void copy_prefix(char* dst, const char* source, std::size_t size) {
+        if (size <= kPrefixCopyBytes) {
+            std::memcpy(dst, source, kPrefixCopyBytes);
+        } else {
+            std::memcpy(dst, source, size);
+        }
+    }
+
+    /// Writes a compact emission record; `full` is only touched for words longer
+    /// than the inline head.
+    static void copy_emit(char* dst, const WordEmit& word, const PhraseWord& full) {
+        if (word.size <= kWordCopyBytes) {
+            std::memcpy(dst, word.head.data(), kWordCopyBytes);
+        } else {
+            std::memcpy(dst, full.text.data(), word.size);
+        }
+    }
+
+    /// Makes the next batch slot writable for a phrase of `length` bytes. A
+    /// batch only ever holds phrases of equal length, so `flush` can hash them
+    /// all with one length and emission can use fixed-size moves.
+    DfsResult begin_phrase(std::size_t length) {
+        if (batch_count_ == kPhraseBatchSize ||
+            (batch_count_ != 0 && length != batch_length_)) {
+            const DfsResult result = flush();
+            if (result != DfsResult::exhausted) {
+                return result;
+            }
+        }
+        batch_length_ = length;
+        return DfsResult::exhausted;
+    }
+
+    [[nodiscard]] char* current_slot() {
+        return batch_storage_.data() + batch_count_ * batch_stride_;
+    }
+
+    /// Publishes the phrase written through `current_slot()`.
+    DfsResult commit_phrase() {
+        ++batch_count_;
+        if (batch_count_ == kPhraseBatchSize) {
+            return flush();
+        }
+        return DfsResult::exhausted;
+    }
+
+    DfsResult add_phrase(const PhraseWord& last, std::size_t depth) {
         if (max_candidates_ != 0 && hashed_ >= max_candidates_) {
             return DfsResult::candidate_budget;
         }
         if constexpr (kTimingEnabled) {
             ++counters_->phrases_emitted;
         }
-        batch_[batch_count_++] = prefix_;
-        if (batch_count_ == batch_.size()) {
-            return flush();
+
+        std::size_t length = last.text.size();
+        for (std::size_t i = 0; i < depth; ++i) {
+            length += chosen_[i]->text.size() + 1;
+        }
+        const DfsResult ready = begin_phrase(length);
+        if (ready != DfsResult::exhausted) {
+            return ready;
+        }
+
+        char* slot = current_slot();
+        std::size_t at = 0;
+        for (std::size_t i = 0; i < depth; ++i) {
+            copy_word(slot + at, *chosen_[i]);
+            at += chosen_[i]->text.size();
+            slot[at++] = ' ';
+        }
+        copy_word(slot + at, last);
+        return commit_phrase();
+    }
+
+    /// Writes `chosen_[0 .. depth-1]`, each followed by a space, into
+    /// `phrase_buffer_`; returns the number of characters written.
+    std::size_t write_prefix(std::size_t depth) {
+        std::size_t length = 0;
+        for (std::size_t i = 0; i < depth; ++i) {
+            const PhraseWord& word = *chosen_[i];
+            copy_word(phrase_buffer_.data() + length, word);
+            length += word.text.size();
+            phrase_buffer_[length++] = ' ';
+        }
+        return length;
+    }
+
+    /// Enumerates the ordered word pairs behind every mixed-radix state, so the
+    /// last two levels of the DFS become one table lookup. Only the states that
+    /// a prefix can leave behind are ever asked for, and the lists preserve the
+    /// (first, second) index order the plain DFS would visit, so the search
+    /// finds the same phrase and reports the same candidates.
+    void BuildPairMemo() {
+        pair_memo_built_ = true;
+        if (!flat_keys_ || words_.size() > kPairMemoWordLimit) {
+            return;
+        }
+
+        // Index work, so it is reported as setup even though it happens lazily
+        // on the first node with two words left. `setup_timer_` is read after
+        // the search returns, so the accumulating timer picks this up without
+        // the caller having to know it happened late.
+        [[maybe_unused]] const Timer::ScopedTimer phase(*setup_timer_, kTimingEnabled);
+        // Measured in every build, not just the instrumented ones: `Stats` has
+        // to exclude setup even where `Timing` itself is compiled out.
+        [[maybe_unused]] const Timer::ScopedTimer measured(lazy_setup_, true);
+        const std::size_t word_count = words_.size();
+
+        // Five bits per distinct letter: with at most seven of any letter, two
+        // packed words add without carrying between fields, and one subtraction
+        // then reports per letter whether the pair stays within the target.
+        // That turns the O(words^2) validity test into a few instructions.
+        std::uint64_t target_packed = 0;
+        std::uint32_t max_count = 0;
+        for (std::size_t k = 0; k < unique_count_; ++k) {
+            target_packed |= static_cast<std::uint64_t>(target_counts_[k]) << (5 * k);
+            max_count = std::max<std::uint32_t>(max_count, target_counts_[k]);
+        }
+        const bool packed_layout = unique_count_ <= kPackedPhraseLetters && max_count <= 7;
+        std::vector<std::uint64_t> packed;
+        if (packed_layout) {
+            packed.resize(word_count);
+            for (std::size_t i = 0; i < word_count; ++i) {
+                std::uint64_t value = 0;
+                for (std::size_t k = 0; k < unique_count_; ++k) {
+                    value |= static_cast<std::uint64_t>(words_[i].counts[k]) << (5 * k);
+                }
+                packed[i] = value;
+            }
+        }
+        const std::uint64_t check = target_packed | kPhraseFieldHigh;
+
+        // `found` packs (key, first, second) into one word so a pair costs eight
+        // bytes until the counting sort below puts it in key order.
+        std::vector<std::uint64_t> found;
+        found.reserve(std::min<std::size_t>(word_count * 8, kPairMemoEntryLimit));
+        const auto record = [&found, this](std::size_t i, std::size_t j) {
+            if (found.size() == kPairMemoEntryLimit) {
+                return false;
+            }
+            found.push_back(
+                (static_cast<std::uint64_t>(words_[i].key + words_[j].key) << 24) |
+                (static_cast<std::uint64_t>(i) << 12) | static_cast<std::uint64_t>(j));
+            return true;
+        };
+
+        for (std::size_t i = 0; i < word_count; ++i) {
+            if (packed_layout) {
+                const std::uint64_t first = packed[i];
+                for (std::size_t j = 0; j < word_count; ++j) {
+                    const std::uint64_t difference = check - (first + packed[j]);
+                    if ((difference & kPhraseFieldHigh) != kPhraseFieldHigh) {
+                        continue;
+                    }
+                    if (!record(i, j)) {
+                        // Too many completions to be worth the memory; keep the
+                        // plain DFS instead of a partial table.
+                        found.clear();
+                        return;
+                    }
+                }
+            } else {
+                for (std::size_t j = 0; j < word_count; ++j) {
+                    if (!PairFits(words_[i], words_[j])) {
+                        continue;
+                    }
+                    if (!record(i, j)) {
+                        found.clear();
+                        return;
+                    }
+                }
+            }
+        }
+
+        pair_offsets_.assign(static_cast<std::size_t>(state_count_) + 1, 0);
+        for (const std::uint64_t entry : found) {
+            ++pair_offsets_[static_cast<std::size_t>(entry >> 24) + 1];
+        }
+        for (std::size_t i = 1; i < pair_offsets_.size(); ++i) {
+            pair_offsets_[i] += pair_offsets_[i - 1];
+        }
+        pair_entries_.resize(found.size());
+        std::vector<std::uint32_t> cursor(pair_offsets_.begin(), pair_offsets_.end() - 1);
+        for (const std::uint64_t entry : found) {
+            pair_entries_[cursor[entry >> 24]++] = PhrasePair{
+                static_cast<std::uint32_t>((entry >> 12) & 0xFFFU),
+                static_cast<std::uint32_t>(entry & 0xFFFU),
+            };
+        }
+        pair_memo_ready_ = true;
+    }
+
+    /// Fallback pair test for a key space too wide for the packed layout.
+    [[nodiscard]] bool PairFits(const PhraseWord& first, const PhraseWord& second) const {
+        for (std::size_t k = 0; k < unique_count_; ++k) {
+            if (first.counts[k] + second.counts[k] > target_counts_[k]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Bottom two levels of the DFS, resolved from the pair memo: the remaining
+    /// letters are known to split into two wordlist words, so there is nothing
+    /// left to prune.
+    DfsResult finish_with_pairs(std::uint64_t remaining_key, std::size_t depth) {
+        const std::size_t key = static_cast<std::size_t>(remaining_key);
+        const std::size_t begin = pair_offsets_[key];
+        const std::size_t end = pair_offsets_[key + 1];
+        if constexpr (kTimingEnabled) {
+            ++counters_->leaf_visits;
+            counters_->leaf_candidates += end - begin;
+            counters_->same_counts_hits += end - begin;
+        }
+        if (begin == end) {
+            return DfsResult::exhausted;
+        }
+
+        const std::size_t prefix = write_prefix(depth);
+        // Every completion uses exactly the letters still remaining, so the
+        // phrase length is the same for the whole memo list.
+        const DfsResult ready = begin_phrase(prefix + remaining_length_ + 1);
+        if (ready != DfsResult::exhausted) {
+            return ready;
+        }
+        const PhrasePair* pairs = pair_entries_.data();
+        const WordEmit* emits = emit_words_.data();
+        for (std::size_t i = begin; i < end; ++i) {
+            if (max_candidates_ != 0 && hashed_ >= max_candidates_) {
+                return DfsResult::candidate_budget;
+            }
+            if constexpr (kTimingEnabled) {
+                ++counters_->phrases_emitted;
+            }
+            const WordEmit& first = emits[pairs[i].first];
+            const WordEmit& last = emits[pairs[i].second];
+            char* slot = current_slot();
+            copy_prefix(slot, phrase_buffer_.data(), prefix);
+            copy_emit(slot + prefix, first, words_[pairs[i].first]);
+            std::size_t at = prefix + first.size;
+            slot[at++] = ' ';
+            copy_emit(slot + at, last, words_[pairs[i].second]);
+            const DfsResult result = commit_phrase();
+            if (result != DfsResult::exhausted) {
+                return result;
+            }
         }
         return DfsResult::exhausted;
     }
@@ -593,39 +944,52 @@ private:
             return DfsResult::exhausted;
         }
 
-        std::array<std::span<const std::byte>, kBatchSize> inputs{};
-        std::array<solve::Digest, kBatchSize> digests{};
-        {
-            [[maybe_unused]] const Timer::ScopedTimer phase(timing_->generate.prepare,
-                                                            kTimingEnabled);
-            for (std::size_t i = 0; i < batch_count_; ++i) {
-                inputs[i] = std::as_bytes(std::span{batch_[i].data(), batch_[i].size()});
+        // Uninitialised on purpose: only the first batch_count_ entries are
+        // written and read.
+        std::array<std::span<const std::byte>, kPhraseBatchSize> inputs;
+        std::array<solve::Digest, kPhraseBatchSize> digests;
+        // One running timer and two peeks instead of three scoped timers: the
+        // phases are measured with four clock reads per batch, not six.
+        Timer::Timer flush_timer(kTimingEnabled);
+        for (std::size_t i = 0; i < batch_count_; ++i) {
+            inputs[i] = std::as_bytes(
+                std::span{batch_storage_.data() + i * batch_stride_, batch_length_});
+        }
+        [[maybe_unused]] const std::chrono::nanoseconds prepared =
+            flush_timer.ElapsedDuration();
+        hashlib::md5_batch(
+            std::span<const std::span<const std::byte>>{inputs.data(), batch_count_},
+            std::span<solve::Digest>{digests.data(), batch_count_});
+        [[maybe_unused]] const std::chrono::nanoseconds hashed =
+            flush_timer.ElapsedDuration();
+
+        std::optional<std::size_t> matched;
+        for (std::size_t i = 0; i < batch_count_; ++i) {
+            if (digests[i] == target_) {
+                matched = i;
+                break;
             }
         }
-        {
-            [[maybe_unused]] const Timer::ScopedTimer phase(hash_timer_, kTimingEnabled);
-            hashlib::md5_batch(
-                std::span<const std::span<const std::byte>>{inputs.data(), batch_count_},
-                std::span<solve::Digest>{digests.data(), batch_count_});
+        flush_timer.Stop();
+
+        if constexpr (kTimingEnabled) {
+            const std::chrono::nanoseconds elapsed = flush_timer.ElapsedDuration();
+            timing_->generate.prepare += prepared;
+            timing_->hash += hashed - prepared;
+            timing_->match += elapsed - hashed;
         }
 
-        {
-            [[maybe_unused]] const Timer::ScopedTimer phase(match_timer_, kTimingEnabled);
-            for (std::size_t i = 0; i < batch_count_; ++i) {
-                if (digests[i] == target_) {
-                    phrase_ = batch_[i];
-                    hashed_ += batch_count_;
-                    batch_count_ = 0;
-                    return DfsResult::found;
-                }
-            }
-        }
         hashed_ += batch_count_;
+        if (matched) {
+            phrase_.assign(batch_storage_.data() + *matched * batch_stride_, batch_length_);
+            batch_count_ = 0;
+            return DfsResult::found;
+        }
         batch_count_ = 0;
         return DfsResult::exhausted;
     }
 
-    DfsResult dfs(std::size_t words_left, std::uint64_t remaining_key) {
+    DfsResult dfs(std::size_t words_left, std::uint64_t remaining_key, std::size_t depth) {
         if (++nodes_ > kPhraseNodeBudget) {
             return DfsResult::node_budget;
         }
@@ -634,11 +998,21 @@ private:
             if constexpr (kTimingEnabled) {
                 ++counters_->leaf_visits;
             }
-            const auto bucket = by_key_.find(remaining_key);
-            if (bucket == by_key_.end()) {
-                return DfsResult::exhausted;
+            std::span<const std::uint32_t> bucket;
+            if (flat_keys_) {
+                const std::size_t key = static_cast<std::size_t>(remaining_key);
+                const std::size_t begin = key_offsets_[key];
+                const std::size_t end = key_offsets_[key + 1];
+                bucket = std::span<const std::uint32_t>{key_entries_.data() + begin, end - begin};
+            } else {
+                const auto found = by_key_.find(remaining_key);
+                if (found == by_key_.end()) {
+                    return DfsResult::exhausted;
+                }
+                bucket = std::span<const std::uint32_t>{found->second.data(),
+                                                        found->second.size()};
             }
-            for (const std::uint32_t index : bucket->second) {
+            for (const std::uint32_t index : bucket) {
                 if constexpr (kTimingEnabled) {
                     ++counters_->leaf_candidates;
                 }
@@ -649,10 +1023,7 @@ private:
                 if constexpr (kTimingEnabled) {
                     ++counters_->same_counts_hits;
                 }
-                const std::size_t old_size = prefix_.size();
-                prefix_ += word.text;
-                const DfsResult result = add_phrase();
-                prefix_.resize(old_size);
+                const DfsResult result = add_phrase(word, depth);
                 if (result != DfsResult::exhausted) {
                     return result;
                 }
@@ -660,7 +1031,44 @@ private:
             return DfsResult::exhausted;
         }
 
-        for (const PhraseWord& word : words_) {
+        // With two words left the remaining letters either split into two
+        // wordlist words or they do not, so the memo answers the whole subtree
+        // without touching the letter counts.
+        if (words_left == 2) {
+            if (!pair_memo_built_) {
+                BuildPairMemo();
+            }
+            if (pair_memo_ready_) {
+                return finish_with_pairs(remaining_key, depth);
+            }
+        }
+
+        // Skip words whose length cannot be part of any remaining phrase.
+        // `words_` is sorted longest-first, so the feasible lengths form one
+        // contiguous iterator range.
+        const std::size_t remaining_words = words_left - 1;
+        const std::size_t min_remaining = remaining_words * min_word_length_;
+        const std::size_t max_remaining = remaining_words * max_word_length_;
+        if (remaining_length_ < min_remaining) {
+            return DfsResult::exhausted;
+        }
+        const std::size_t max_len = remaining_length_ - min_remaining;
+        const std::size_t min_len =
+            remaining_length_ > max_remaining ? remaining_length_ - max_remaining : 1;
+        if (max_len < min_len) {
+            return DfsResult::exhausted;
+        }
+
+        const auto length_above = [](const PhraseWord& word, std::size_t length) {
+            return word.text.size() > length;
+        };
+        const auto begin =
+            std::lower_bound(words_.begin(), words_.end(), max_len, length_above);
+        const auto end =
+            std::lower_bound(words_.begin(), words_.end(), min_len - 1, length_above);
+
+        for (auto it = begin; it != end; ++it) {
+            const PhraseWord& word = *it;
             if constexpr (kTimingEnabled) {
                 ++counters_->fits_calls;
             }
@@ -670,23 +1078,13 @@ private:
             if constexpr (kTimingEnabled) {
                 ++counters_->fits_passes;
             }
-            const std::size_t remaining_after = remaining_length_ - word.text.size();
-            if (remaining_after < (words_left - 1) * min_word_length_) {
-                continue;
-            }
-            if (remaining_after > (words_left - 1) * max_word_length_) {
-                continue;
-            }
 
             Subtract(word);
-            const std::size_t old_size = prefix_.size();
-            prefix_ += word.text;
-            prefix_ += ' ';
+            chosen_[depth] = &word;
             if constexpr (kTimingEnabled) {
                 ++counters_->edges;
             }
-            const DfsResult result = dfs(words_left - 1, remaining_key - word.key);
-            prefix_.resize(old_size);
+            const DfsResult result = dfs(words_left - 1, remaining_key - word.key, depth + 1);
             Add(word);
             if (result != DfsResult::exhausted) {
                 return result;
@@ -699,8 +1097,12 @@ private:
     std::uint64_t max_candidates_ = 0;
     solve::Timing* timing_ = nullptr;
     solve::Counters* counters_ = nullptr;
-    Timer::Timer hash_timer_;
-    Timer::Timer match_timer_;
+    /// The caller's setup timer. Kept so lazily built index work (the pair memo)
+    /// is charged to `setup` where it belongs, even though it runs mid-search.
+    Timer::Timer* setup_timer_ = nullptr;
+    /// Cost of that lazily built work, so `Stats::elapsed` can leave setup out
+    /// of the reported search duration.
+    std::chrono::nanoseconds lazy_setup_{0};
     std::string error_;
     std::size_t max_words_ = 0;
     std::size_t total_letters_ = 0;
@@ -708,6 +1110,8 @@ private:
     std::array<std::uint8_t, 256> index_of_{};
     std::array<std::uint16_t, kMaxPhraseUnique> target_counts_{};
     std::array<std::uint16_t, kMaxPhraseUnique> remaining_counts_{};
+    std::uint64_t full_mask_ = 0;
+    std::uint64_t remaining_mask_ = 0;
     std::array<std::uint64_t, kMaxPhraseUnique> strides_{};
     std::uint64_t state_count_ = 1;
     std::uint64_t target_key_ = 0;
@@ -715,10 +1119,21 @@ private:
     std::size_t max_word_length_ = 0;
     std::size_t min_word_length_ = 0;
     std::vector<PhraseWord> words_;
+    std::vector<WordEmit> emit_words_;
+    bool flat_keys_ = false;
+    std::vector<std::uint32_t> key_offsets_;
+    std::vector<std::uint32_t> key_entries_;
+    bool pair_memo_built_ = false;
+    bool pair_memo_ready_ = false;
+    std::vector<std::uint32_t> pair_offsets_;
+    std::vector<PhrasePair> pair_entries_;
     std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> by_key_;
-    std::array<std::string, kBatchSize> batch_{};
+    std::vector<char> batch_storage_;
+    std::size_t batch_stride_ = 0;
+    std::size_t batch_length_ = 0;
     std::size_t batch_count_ = 0;
-    std::string prefix_;
+    std::array<const PhraseWord*, kMaxPhraseWords> chosen_{};
+    std::vector<char> phrase_buffer_;
     std::string phrase_;
     std::uint64_t hashed_ = 0;
     std::uint64_t nodes_ = 0;
