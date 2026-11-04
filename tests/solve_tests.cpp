@@ -277,6 +277,32 @@ TEST(SolveTest, DictionaryAcceptsBomAndCrlf) {
     EXPECT_EQ(outcome.solution->candidate, "listen");
 }
 
+TEST(SolveTest, DictionaryReadsAcrossChunkBoundaries) {
+        // The reader fills a 256 KiB buffer.
+        // Put "listen" so that it starts three bytes before that boundary and continues in the next chunk.
+    std::string contents(256 * 1024 - 4, 'z');
+    contents.push_back('\n');
+    contents += "listen\n";
+
+    const solve::Outcome outcome = SolveWithWordlist(contents, "listen", "silent");
+    ASSERT_EQ(outcome.status, solve::Status::found);
+    ASSERT_TRUE(outcome.solution.has_value());
+    EXPECT_EQ(outcome.solution->candidate, "listen");
+}
+
+TEST(SolveTest, DictionaryReadsTokenEndingAtChunkBoundary) {
+        // "listen" ends exactly on the 256 KiB boundary, so the delimiter before "silent" is the first byte of the next chunk.
+        // The two entries must stay separate.
+    std::string contents(256 * 1024 - 7, 'z');
+    contents.push_back('\n');
+    contents += "listen\nsilent\n";
+
+    const solve::Outcome outcome = SolveWithWordlist(contents, "listen", "silent");
+    ASSERT_EQ(outcome.status, solve::Status::found);
+    ASSERT_TRUE(outcome.solution.has_value());
+    EXPECT_EQ(outcome.solution->candidate, "listen");
+}
+
 TEST(SolveTest, AutoCountsWordlistTokensNotLines) {
     // One line, three entries. P("ab") = 2, so permutations should win.
     // If the selector counted lines it would see one entry and pick the dictionary.
@@ -366,6 +392,39 @@ TEST(SolveTest, AutoUsesRepeatedLetterCount) {
     const std::optional<solve::Plan> plan = solve::PlanSearch(problem, "auto", error);
     ASSERT_TRUE(plan.has_value()) << error;
     EXPECT_EQ(plan->solver, "permutations");
+}
+
+TEST(SolveTest, AutoFallsBackToPermutationsForEmptyWordlist) {
+    const TempWordlist words{""};
+
+    solve::SearchProblem problem;
+    problem.target.digest = DigestOf("ab");
+    problem.anagram = solve::Anagram{"ab"};
+    problem.wordlist = solve::Wordlist{words.path()};
+
+    std::string error;
+    const std::optional<solve::Plan> plan = solve::PlanSearch(problem, "auto", error);
+    ASSERT_TRUE(plan.has_value()) << error;
+    EXPECT_EQ(plan->solver, "permutations");
+    EXPECT_EQ(plan->estimated_candidates, 2u);
+}
+
+TEST(SolveTest, AutoUsesFileSizeWhenItProvesTheWordlistIsCheaper) {
+        // Four bytes hold at most two entries (token/delimiter alternating), and "aab" has three distinct permutations.
+        // The dictionary therefore wins without counting the file.
+        // The estimate stays zero because nothing was counted.
+    const TempWordlist words{"a\nb\n"};
+
+    solve::SearchProblem problem;
+    problem.target.digest = DigestOf("aab");
+    problem.anagram = solve::Anagram{"aab"};
+    problem.wordlist = solve::Wordlist{words.path()};
+
+    std::string error;
+    const std::optional<solve::Plan> plan = solve::PlanSearch(problem, "auto", error);
+    ASSERT_TRUE(plan.has_value()) << error;
+    EXPECT_EQ(plan->solver, "dictionary");
+    EXPECT_EQ(plan->estimated_candidates, 0u);
 }
 
 TEST(SolveTest, WithoutAWordlistAutoUsesPermutations) {

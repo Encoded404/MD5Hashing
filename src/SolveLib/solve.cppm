@@ -85,13 +85,15 @@ struct Timing {
         }
     };
 
-    /// Choosing the strategy, including counting wordlist entries for `auto`.
+    /// Choosing the strategy, including whatever wordlist counting the choice needs.
+    /// Explicit solvers and the phrase strategy skip that count.
     std::chrono::nanoseconds planning{0};
-    /// Building the candidate source: sorting the permutation seed, or opening,
-    /// reading and indexing the wordlist for the phrase solver. The phrase
-    /// solver builds its pair-completion index lazily, on the first node with
-    /// two words left, so some of this number is measured after the search has
-    /// started; it is still indexing, not searching.
+    /// Building the candidate source:
+    /// sorting the permutation seed.
+    /// opening, reading and indexing the wordlist for the phrase solver.
+    ///
+    /// The phrase solver builds pair completions on demand as the search reaches two-word states, and builds the full pair table once it has asked for enough of them.
+    /// Some of this number is therefore measured after the search has started, but it is still indexing, not searching.
     std::chrono::nanoseconds setup{0};
     /// Producing candidates, broken down by what the selected solver spends its
     /// time on.
@@ -169,9 +171,11 @@ struct SolverInfo {
 struct Plan {
     std::string_view solver;
     std::string reason;
-    /// Upper bound on hashed candidates (for permutations, the exact count).
+    /// Upper bound on hashed candidates when it is cheap to know it (for permutations, the exact count).
+    /// Zero when the strategy has no useful pre-search bound, or when the wordlist was not counted.
     std::uint64_t estimated_candidates = 0;
-    /// Work the strategy performs before/while hashing (lines read, etc.).
+    /// Work the strategy performs before/while hashing when it is known (lines read, etc.).
+    /// Zero when the solver counts entries during the search.
     std::uint64_t estimated_scanned = 0;
 };
 
@@ -180,6 +184,10 @@ std::span<const SolverInfo> Solvers();
 
 /// Chooses a strategy without running it. `requested` is "auto" or a solver id.
 /// Returns nullopt and fills `error` when no strategy fits the problem.
+///
+/// Counting wordlist entries is a full scan, so it is only done when the automatic single-word choice needs the comparison.
+/// It stops once the permutation count is reached.
+/// An explicit dictionary or phrase request only validates the file header here, and its estimates are left at zero.
 std::optional<Plan> PlanSearch(const SearchProblem& problem, std::string_view requested,
                                std::string& error);
 

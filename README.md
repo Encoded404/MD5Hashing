@@ -151,6 +151,10 @@ look up; equality is byte-wise, which matches the challenge's ASCII payloads.
 With `--wordlist`, `auto` compares the number of distinct permutations
 (`n! / ∏ cᵢ!`) with the number of wordlist entries and picks the cheaper
 single-word strategy; `--solver permutations|dictionary|phrase` forces one.
+The comparison is decided as soon as the count reaches the permutation count
+(or, when the file is smaller than that count, by its size), so a large wordlist
+is not read to the end just to plan. Explicit `dictionary` / `phrase` requests
+do not pre-count at all; they scan the list as they search.
 
 If `--anagram-of` contains spaces, `auto` treats it as a multi-word anagram and
 selects the `phrase` solver, which requires a wordlist. The phrase solver strips
@@ -166,7 +170,8 @@ anagram because it cannot compose phrases; the two examples above find
 `--wordlist` is read best-effort rather than with a strict one-format parser:
 plain text with one entry per line is the canonical form, but CSV/TSV,
 comma/whitespace separated lists, Hunspell-style `word/flags` entries, and JSON
-arrays (or objects containing arrays) of strings all work. UTF-8 with or
+arrays (or objects containing arrays) of strings all work. The file is tokenized
+in one buffered pass, so the list is not copied line by line. UTF-8 with or
 without a BOM and LF/CRLF/CR endings are handled; blank lines and `#` / `//`
 comments are skipped. gzip-compressed and UTF-16 files are rejected with an
 actionable message instead of being read as mojibake, and a leading `~` in the
@@ -175,9 +180,10 @@ path is expanded.
 The candidate is the only thing written to stdout, so it can be captured
 directly; diagnostics go to stderr. The exit code is 0 when a candidate is
 found and 1 when the space is exhausted. `--explain` prints the chosen solver
-and its cost estimate before searching, `--dry-run` stops there,
-`--max-candidates` bounds hashed candidates, and the phrase solver also stops
-at its internal prefix budget.
+and its cost estimate before searching when one is available (`auto` counts
+entries only as far as the comparison needs; explicit solvers report no entry
+count), `--dry-run` stops there, `--max-candidates` bounds hashed candidates,
+and the phrase solver also stops at its internal prefix budget.
 
 Debug and RelWithDebInfo builds also log a per-phase timing breakdown after a
 solve: planning, wordlist setup/indexing, candidate generation (split into the
@@ -185,9 +191,11 @@ solver-specific `permute`, `scan`, `filter` and `dfs` sub-phases, plus
 `prepare`), `md5_batch`, digest comparison, and the solve and pipeline totals.
 The phrase solver additionally splits `dfs` by phrase length and reports work
 counters (`Fits` calls/passes, edges, leaf visits/candidates, same-count hits,
-phrases emitted). The instrumentation is compiled out in Release, so its search
-loop is unchanged; the `Timer` module it uses lives in `TimerLib` and is shared
-with the CLI benchmarks.
+phrases emitted). Its two-word completion table is built on demand and only
+expanded to the full table once the search reaches enough states, so
+`setup/index` reflects the work the search actually needed. The instrumentation
+is compiled out in Release, so its search loop is unchanged; the `Timer` module
+it uses lives in `TimerLib` and is shared with the CLI benchmarks.
 
 ## Prerequisites
 
