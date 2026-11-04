@@ -31,16 +31,25 @@ if(CMAKE_CONFIGURATION_TYPES)
     )
 endif()
 
-# One module interface, one implementation unit. The interface is PUBLIC so the
-# app and the tests can `import solve;`.
+# The public `solve` interface, the vocabulary module it re-exports, and an internal `solve.detail` module holding declarations the implementation units share.
+# All three are in the file set because CMake needs every module interface listed; consumers only import `solve`.
 target_sources(${SOLVE_LIBRARY_TARGET} PUBLIC
     FILE_SET CXX_MODULES
     FILES
         solve.cppm
+        solve.types.cppm
+        solve.detail.cppm
 )
 
+# One unit per concern: the public API glue, wordlist I/O, the candidate sources
+# and hash driver, each phrase engine, and planning.
 target_sources(${SOLVE_LIBRARY_TARGET} PRIVATE
     solve.cpp
+    wordlist.cpp
+    engine.cpp
+    phrase.cpp
+    phrase_v1.cpp
+    plan.cpp
 )
 
 target_link_libraries(${SOLVE_LIBRARY_TARGET} PRIVATE project_sections project_size)

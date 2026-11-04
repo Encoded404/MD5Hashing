@@ -32,7 +32,7 @@ modern-cmake-app-template/
 │   │   ├── utilities.cppm
 │   │   └── batch/
 │   │       ├── batch.cppm                  # export module hashlib.batch; (ABI + 64-step body)
-│   │       ├── hash_many.cpp               # module hashlib; (padding + lane scheduling)
+│   │       ├── hash_many.cpp               # module hashlib; (padding, equal-length fast path, lane scheduling)
 │   │       ├── dispatch.cpp                # module hashlib.batch; (CPU detection, best kernel)
 │   │       ├── kernel_sse2.cpp             # module hashlib.batch; 4 lanes
 │   │       ├── kernel_avx2.cpp             # module hashlib.batch; 8 or 16 lanes
@@ -43,8 +43,15 @@ modern-cmake-app-template/
 │   │   └── Timer.cppm                      # export module Timer; (Timer + ScopedTimer)
 │   └── SolveLib/
 │       ├── CMakeLists.txt
-│       ├── solve.cpp                       # permutation/dictionary/phrase sources + batch engine
-│       └── solve.cppm                      # export module solve; (problem + selection API)
+│       ├── solve.cppm                      # export module solve; (API declarations, re-exports types)
+│       ├── solve.types.cppm                # export module solve.types; (problem, plan, outcome types)
+│       ├── solve.detail.cppm               # export module solve.detail; (shared internals)
+│       ├── solve.cpp                       # module solve; (utilities + Solve overloads)
+│       ├── plan.cpp                        # module solve; (solver table + PlanSearch)
+│       ├── wordlist.cpp                    # module solve.detail; (buffered tokenizer)
+│       ├── engine.cpp                      # module solve.detail; (candidate sources + batch driver)
+│       ├── phrase.cpp                      # module solve.detail; (optimized phrase solver)
+│       └── phrase_v1.cpp                   # module solve.detail; (first-version baseline)
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── hashlib_tests.cpp                   # gtest headers first, then import std;
@@ -150,11 +157,11 @@ mutually exclusive). `--anagram-of` is the character multiset, not a word to
 look up; equality is byte-wise, which matches the challenge's ASCII payloads.
 With `--wordlist`, `auto` compares the number of distinct permutations
 (`n! / ∏ cᵢ!`) with the number of wordlist entries and picks the cheaper
-single-word strategy; `--solver permutations|dictionary|phrase` forces one.
-The comparison is decided as soon as the count reaches the permutation count
-(or, when the file is smaller than that count, by its size), so a large wordlist
-is not read to the end just to plan. Explicit `dictionary` / `phrase` requests
-do not pre-count at all; they scan the list as they search.
+single-word strategy; `--solver permutations|dictionary|phrase|phrase-v1` forces
+one. The comparison is decided as soon as the count reaches the permutation
+count (or, when the file is smaller than that count, by its size), so a large
+wordlist is not read to the end just to plan. Explicit `dictionary` / `phrase` /
+`phrase-v1` requests do not pre-count at all; they scan the list as they search.
 
 If `--anagram-of` contains spaces, `auto` treats it as a multi-word anagram and
 selects the `phrase` solver, which requires a wordlist. The phrase solver strips
@@ -166,6 +173,16 @@ explores a bounded number of prefixes (currently 100 million) across all word
 counts and reports if that budget is hit. `dictionary` refuses a multi-word
 anagram because it cannot compose phrases; the two examples above find
 `printout stout yawls` and `wu lisp not statutory`.
+
+`phrase-v1` is the phrase solver from the commit that first introduced it
+(`2fdd97e`), kept as a benchmark baseline. It runs the original recursive,
+count-based DFS and hashes through the current `md5_batch` SIMD kernels, but it
+has none of the later search optimizations: no packed letter counts, no flat
+leaf index, no two-word completion table, and no fixed-size phrase slots. Both
+solvers use the same SIMD hash kernel, but `phrase` also groups candidates by
+length and hashes pre-padded blocks, so the two `hash` phases are not directly
+comparable. The difference between the solvers is therefore mostly a difference
+in the search. `phrase-v1` is slower by design, and `auto` never selects it.
 
 `--wordlist` is read best-effort rather than with a strict one-format parser:
 plain text with one entry per line is the canonical form, but CSV/TSV,

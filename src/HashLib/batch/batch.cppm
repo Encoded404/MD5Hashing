@@ -38,6 +38,10 @@ struct KernelSet {
 /// Compiled for the baseline ISA: it must run before any AVX code can.
 [[nodiscard]] KernelSet SelectBatchKernels() noexcept;
 
+/// Compresses `blockCount` whole blocks that already carry the MD5 padding, chaining them into `state`, one block at a time and without any SIMD.
+/// The scalar fallback of `md5_batch` replays the message through `md5_fast`, which pads; a padded block carries no message length to replay, so this is what `md5_batch_padded` uses when the runtime selected no batch kernel.
+void CompressPaddedScalar(const std::byte* blocks, std::size_t blockCount, std::uint32_t* state) noexcept;
+
 }  // namespace hashlib::detail
 
 namespace hashlib::detail {

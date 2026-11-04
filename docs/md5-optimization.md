@@ -267,44 +267,80 @@ exercises each available kernel on one machine; Intel SDE or a Zen 4/5 runner
 is needed to execute the AVX-512 path.
 
 Re-measured on the Zen 5 machine (AVX-512), `HashApp -b --benchmark-batch 16`
-(which selects the single-group kernel), `md5_batch` against `md5_fast` on the
-same build:
+(which selects the single-group AVX-512 kernel), `md5_batch` against `md5_fast`
+on the same build:
 
 | message | `md5_fast` GB/s | `md5_batch` GB/s | speed-up |
 |---|---|---|---|
-| 43 B | 0.70 | 3.58 | 5.1x |
-| 1 KiB | 0.99 | 6.64 | 6.7x |
-| 4 KiB | 1.09 | 7.02 | 6.4x |
-| 64 KiB | 1.10 | 7.16 | 6.5x |
-| 100 KB | 1.10 | 7.31 | 6.6x |
+| 43 B | 0.69 | 3.66 | 5.3x |
+| 1 KiB | 1.02 | 6.79 | 6.7x |
+| 4 KiB | 1.07 | 7.27 | 6.8x |
+| 64 KiB | 1.09 | 7.39 | 6.8x |
+| 100 KB | 1.08 | 7.40 | 6.9x |
 
-Forced kernels at 4 KiB, one group each: sse2 (4 lanes) 1.54, avx2 (8 lanes)
-3.60, avx512f (16 lanes) 7.02, scalar (1 lane) 1.07 GB/s. That scaling is linear
-in lanes because the step chain, not the ALUs, sets the time per call — the same
-observation that makes a second group nearly free.
+Forced kernels at 4 KiB, same batch size: sse2 (4 lanes) 1.52, avx2 (16 lanes,
+two groups) 6.84, avx512f (16 lanes, one group) 7.38, scalar (1 lane) 1.07 GB/s.
+The two-group AVX2 kernel lands within 8% of the one-group AVX-512 kernel, which
+is the same observation from the other direction: the number of independent
+chains sets the time per call, not the lane width.
 
 With the interleaved kernels the same `HashApp -b` run, by batch size:
 
 | messages/call | kernel | 43 B ns/hash | 4 KiB ns/hash |
 |---|---|---|---|
-| 16 | AVX-512, 1 group | 12.4 | 577 |
-| 32 | AVX-512, 2 groups | 7.8 | 315 |
-| 64 | AVX-512, 4 groups | 6.3 | 227 |
+| 16 | AVX-512, 1 group | 11.4 | 562 |
+| 32 | AVX-512, 2 groups | 6.7 | 288 |
+| 64 | AVX-512, 4 groups | 5.1 | 205 |
 
 At 43 B the per-message padding and bookkeeping do not shrink with the kernel,
-so the call gains 1.6x at 32 messages and 2.0x at 64; at 4 KiB the kernel
-dominates and the four-group kernel is 2.5x the one-group one. Batches larger
-than 64 keep the same per-message cost (2.2x at 64 KiB), because they simply
-take more calls.
+so the call gains 1.7x at 32 messages and 2.2x at 64; at 4 KiB the kernel
+dominates and the four-group kernel is 2.7x the one-group one. Batches larger
+than 64 keep the same per-message cost, because they simply take more calls.
+
+### Per-message bookkeeping in `md5_batch`
+
+At one block per message the four-group kernel spends 3.2 ns per message, and
+the wrapper around it was spending about as much again. Two properties of the
+caller decide what can be removed. Callers that group their messages by length,
+as the phrase solver does, hand over batches where every span has the same size.
+And `md5_batch` is the only place that pads, so it is also the only place that
+knows how much of the work repeats per lane.
+
+The wrapper therefore takes a fast path when a batch is equal-length. One tail
+block is built once and copied into every lane with a constant-size move, the
+per-lane `memcpy` of the message prefix becomes a fixed-size overlapping copy
+instead of a call to the C library, the initial state is written with four
+constant vector fills instead of four stores per lane, every lane finishes on
+the same block so the per-lane block choice and per-lane digest test disappear,
+and the digests are packed in one pass at the end. Unequal lengths keep the old
+per-lane path unchanged.
+
+`utilities::PackValues` also moved into the module interface. It is four moves,
+and as an implementation-unit function it could never be inlined, so every
+message paid a call to pack its digest.
+
+Measured on the Zen 5 machine, 21-byte messages, `HashApp -b
+--benchmark-batch 64`, best of five:
+
+| version | ns/call | ns/hash |
+|---|---|---|
+| per-lane padding | 390.8 | 6.1 |
+| equal-length fast path | 300.0 | 4.7 |
+
+That is 1.30x on the call, and it leaves 1.5 ns per message of bookkeeping
+against 3.2 ns of compression. In the phrase solver the `hash` phase went from
+47.7 ms to 36.0 ms on the 7,260,272-candidate search, and the solve total from
+101 ms to 88 ms.
 
 A step is `vpternlogd`, `vpaddd`, `vprold`, `vpaddd`, and Zen 5 vector ALU
 operations measure 2 cycles each (the GPR `add`/`rol` path is 1), so one step is
 8 cycles and one block of 16 messages is 512 cycles: 2 bytes per cycle, or
 11 GB/s at 5.5 GHz. That is a latency bound, not a throughput bound — the ALUs
-are less than half busy — which is exactly why the extra groups work. 7.02 GB/s
-was 1.27 bytes per cycle, about 64% of the one-group bound; the missing third is
-the per-block transpose and the per-lane pointer and digest bookkeeping in
-`hash_many.cpp`, which scale with lanes and blocks rather than with bytes.
+are less than half busy — which is exactly why the extra groups work. 7.29 GB/s
+was 1.32 bytes per cycle, about 66% of the one-group bound; most of the missing
+third is the per-block transpose, and the rest is the per-lane pointer and digest
+bookkeeping in `hash_many.cpp`, which scale with lanes and blocks rather than
+with bytes.
 
 ## Compiler flags
 

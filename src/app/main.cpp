@@ -643,8 +643,8 @@ int main(int argc, char** argv) {
     std::string solve_solver = "auto";
     solve_command
         ->add_option("--solver", solve_solver,
-                     "Search strategy: auto, permutations, dictionary or phrase")
-        ->check(CLI::IsMember({"auto", "permutations", "dictionary", "phrase"},
+                     "Search strategy: auto, permutations, dictionary, phrase or phrase-v1")
+        ->check(CLI::IsMember({"auto", "permutations", "dictionary", "phrase", "phrase-v1"},
                               CLI::ignore_case))
         ->capture_default_str();
     std::uint64_t solve_max_candidates = 0;

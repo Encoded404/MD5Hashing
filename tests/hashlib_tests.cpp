@@ -240,11 +240,161 @@ TEST(HashLibTest, Md5BatchMatchesSingleForMixedLengths) {
     }
 }
 
+// md5_batch takes a separate fast path when every message in the batch has the same length, which is what a caller that groups by length (the phrase solver) always hands it.
+// Cover that path on its own, at the same padding boundaries, with an exact number of lanes, one that leaves the last batch short, and one that leaves it with a single lane.
+TEST(HashLibTest, Md5BatchMatchesSingleForEqualLengths) {
+    constexpr std::array<std::size_t, 19> kLengths{
+        0, 1, 2, 3, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 191, 192, 255, 1000};
+
+    for (const std::size_t length : kLengths) {
+        for (const std::size_t batchSize :
+             {std::size_t{64}, std::size_t{100}, std::size_t{129}, std::size_t{257}}) {
+            SCOPED_TRACE("length " + std::to_string(length) + ", batch size " +
+                         std::to_string(batchSize));
+
+            std::vector<std::string> messages;
+            messages.reserve(batchSize);
+            for (std::size_t i = 0; i < batchSize; ++i) {
+                std::string message(length, '\0');
+                for (std::size_t j = 0; j < length; ++j) {
+                    // Position-dependent: identical messages would hide a lane that reads the wrong one.
+                    message[j] = static_cast<char>((i * 131 + j * 37 + 11) & 0xFF);
+                }
+                messages.push_back(std::move(message));
+            }
+
+            std::vector<std::span<const std::byte>> inputs;
+            inputs.reserve(batchSize);
+            for (const std::string& message : messages) {
+                inputs.emplace_back(std::as_bytes(std::span{message.data(), message.size()}));
+            }
+
+            std::vector<hashlib::Digest> digests(batchSize + 3);
+            hashlib::md5_batch(inputs, digests);
+
+            for (std::size_t i = 0; i < batchSize; ++i) {
+                SCOPED_TRACE("index " + std::to_string(i));
+                EXPECT_EQ(digests[i], hashlib::md5_fast(inputs[i]));
+            }
+
+            // The uniform entry point skips the per-batch equality check, so it must agree with the checked one on exactly this input.
+            std::vector<hashlib::Digest> uniformDigests(batchSize + 3);
+            hashlib::md5_batch_uniform(inputs, uniformDigests);
+            for (std::size_t i = 0; i < batchSize; ++i) {
+                SCOPED_TRACE("uniform index " + std::to_string(i));
+                EXPECT_EQ(uniformDigests[i], digests[i]);
+            }
+        }
+    }
+}
+
+TEST(HashLibTest, Md5BatchUniformHandlesEmptyBatch) {
+    std::vector<std::span<const std::byte>> inputs;
+    std::vector<hashlib::Digest> digests;
+    hashlib::md5_batch_uniform(inputs, digests);
+    EXPECT_TRUE(digests.empty());
+}
+
 TEST(HashLibTest, Md5BatchHandlesEmptyBatch) {
     std::vector<std::span<const std::byte>> inputs;
     std::vector<hashlib::Digest> digests;
     hashlib::md5_batch(inputs, digests);
     EXPECT_TRUE(digests.empty());
+}
+
+// md5_batch_padded skips the padding the library otherwise builds, so the test has to build it the same way: 0x80, zeros, and the bit length little-endian, in whole 64-byte blocks.
+TEST(HashLibTest, Md5BatchPaddedMatchesSingle) {
+    constexpr std::array<std::size_t, 12> kLengths{0, 1, 55, 56, 57, 63, 64, 100, 119, 120, 128, 1000};
+
+    for (const std::size_t length : kLengths) {
+        for (const std::size_t batchSize : {std::size_t{1}, std::size_t{17}, std::size_t{64}, std::size_t{129}}) {
+            SCOPED_TRACE("length " + std::to_string(length) + ", batch size " +
+                         std::to_string(batchSize));
+
+            const std::size_t padded = (length + 9 + 63) / 64 * 64;
+            std::vector<std::string> messages;
+            messages.reserve(batchSize);
+            for (std::size_t i = 0; i < batchSize; ++i) {
+                std::string message(padded, '\0');
+                for (std::size_t j = 0; j < length; ++j) {
+                    message[j] = static_cast<char>((i * 131 + j * 37 + 11) & 0xFF);
+                }
+                message[length] = static_cast<char>(0x80);
+                const std::uint64_t bits = static_cast<std::uint64_t>(length) * 8;
+                std::memcpy(message.data() + padded - sizeof(bits), &bits, sizeof(bits));
+                messages.push_back(std::move(message));
+            }
+
+            std::vector<std::span<const std::byte>> blocks;
+            blocks.reserve(batchSize);
+            for (const std::string& message : messages) {
+                blocks.emplace_back(std::as_bytes(std::span{message.data(), message.size()}));
+            }
+
+            std::vector<hashlib::Digest> digests(batchSize + 3);
+            hashlib::md5_batch_padded(blocks, digests);
+
+            for (std::size_t i = 0; i < batchSize; ++i) {
+                SCOPED_TRACE("index " + std::to_string(i));
+                const auto unpadded = std::as_bytes(std::span{messages[i].data(), length});
+                EXPECT_EQ(digests[i], hashlib::md5_fast(unpadded));
+            }
+        }
+    }
+}
+
+TEST(HashLibTest, Md5BatchPaddedHandlesEmptyBatch) {
+    std::vector<std::span<const std::byte>> blocks;
+    std::vector<hashlib::Digest> digests;
+    hashlib::md5_batch_padded(blocks, digests);
+    EXPECT_TRUE(digests.empty());
+    EXPECT_EQ(hashlib::md5_batch_padded_find(blocks, hashlib::Digest{}), hashlib::kNoDigestMatch);
+}
+
+// md5_batch_padded_find answers the same question as hashing every block and scanning the digests, so the test derives the answer that way.
+TEST(HashLibTest, Md5BatchPaddedFindLocatesTheDigest) {
+    constexpr std::size_t kLength = 21;
+    constexpr std::size_t kBatchSize = 150;
+    constexpr std::size_t kPadded = 64;
+
+    std::vector<std::string> messages;
+    messages.reserve(kBatchSize);
+    for (std::size_t i = 0; i < kBatchSize; ++i) {
+        std::string message(kPadded, '\0');
+        for (std::size_t j = 0; j < kLength; ++j) {
+            message[j] = static_cast<char>((i * 37 + j * 11 + 5) & 0xFF);
+        }
+        message[kLength] = static_cast<char>(0x80);
+        const std::uint64_t bits = static_cast<std::uint64_t>(kLength) * 8;
+        std::memcpy(message.data() + kPadded - sizeof(bits), &bits, sizeof(bits));
+        messages.push_back(std::move(message));
+    }
+
+    std::vector<std::span<const std::byte>> blocks;
+    blocks.reserve(kBatchSize);
+    for (const std::string& message : messages) {
+        blocks.emplace_back(std::as_bytes(std::span{message.data(), message.size()}));
+    }
+
+    // Every position, including the first, the last, and the ones past the widest kernel's width.
+    for (const std::size_t index : {std::size_t{0}, std::size_t{63}, std::size_t{64}, std::size_t{149}}) {
+        SCOPED_TRACE("index " + std::to_string(index));
+        const auto unpadded = std::as_bytes(std::span{messages[index].data(), kLength});
+        const hashlib::Digest wanted = hashlib::md5_fast(unpadded);
+        EXPECT_EQ(hashlib::md5_batch_padded_find(blocks, wanted), index);
+    }
+
+    // A digest that no block produces, including one that differs only in its last byte.
+    const hashlib::Digest absent = hashlib::md5_fast(std::as_bytes(std::span{"absent"}));
+    EXPECT_EQ(hashlib::md5_batch_padded_find(blocks, absent), hashlib::kNoDigestMatch);
+    hashlib::Digest nearly = hashlib::md5_fast(std::as_bytes(std::span{messages[7].data(), kLength}));
+    nearly[15] = static_cast<std::byte>(std::to_integer<unsigned>(nearly[15]) ^ 1U);
+    EXPECT_EQ(hashlib::md5_batch_padded_find(blocks, nearly), hashlib::kNoDigestMatch);
+
+    // Every block hashed at once, so the scan across kernel widths is not the only shape covered.
+    std::vector<std::span<const std::byte>> single{blocks[42]};
+    const auto singleMessage = std::as_bytes(std::span{messages[42].data(), kLength});
+    EXPECT_EQ(hashlib::md5_batch_padded_find(single, hashlib::md5_fast(singleMessage)), std::size_t{0});
 }
 
 // The runtime picks the widest kernel the CPU supports, so an ordinary run only

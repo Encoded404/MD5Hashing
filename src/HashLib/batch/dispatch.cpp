@@ -47,7 +47,8 @@ namespace {
 
 [[maybe_unused]] bool HaveAvx512F() noexcept {
 #  if defined(__clang__) || defined(__GNUC__)
-    // The AVX-512 kernel also uses AVX2 for its 16x16 transpose.
+    // The AVX-512 kernels are built with AVX2 enabled, and the dispatcher requires
+    // it so that code generation is always legal on the CPU it selects for.
     return __builtin_cpu_supports("avx512f") != 0 &&
            __builtin_cpu_supports("avx2") != 0;
 #  elif defined(_MSC_VER)
@@ -147,6 +148,74 @@ KernelSet SelectBatchKernels() noexcept {
     std::reverse(set.kernels.begin(), set.kernels.begin() + static_cast<std::ptrdiff_t>(count));
     set.count = count;
     return set;
+}
+
+namespace {
+
+// MD5 reads its message words little-endian, and this is the only implementation here that is not built for a little-endian ISA assumption.
+[[nodiscard]] std::uint32_t LoadLe32(const std::byte* bytes) noexcept {
+    std::uint32_t value;
+    std::memcpy(&value, bytes, sizeof(value));
+    if constexpr (std::endian::native == std::endian::big) {
+        value = std::byteswap(value);
+    }
+    return value;
+}
+
+}  // namespace
+
+void CompressPaddedScalar(const std::byte* blocks, std::size_t blockCount, std::uint32_t* state) noexcept {
+    std::uint32_t a = state[0];
+    std::uint32_t b = state[1];
+    std::uint32_t c = state[2];
+    std::uint32_t d = state[3];
+
+    for (std::size_t block = 0; block < blockCount; ++block) {
+        const std::byte* bytes = blocks + block * 64;
+        std::array<std::uint32_t, 16> message{};
+        for (std::size_t word = 0; word < message.size(); ++word) {
+            message[word] = LoadLe32(bytes + word * 4);
+        }
+
+        const std::uint32_t startA = a;
+        const std::uint32_t startB = b;
+        const std::uint32_t startC = c;
+        const std::uint32_t startD = d;
+
+        // Written as RFC 1321 prints it, with the state words rotating through A..D, because this fallback is chosen for clarity over speed.
+        for (std::size_t step = 0; step < 64; ++step) {
+            std::uint32_t f = 0;
+            std::size_t g = 0;
+            if (step < 16) {
+                f = (b & c) | (~b & d);
+                g = step;
+            } else if (step < 32) {
+                f = (d & b) | (~d & c);
+                g = (5 * step + 1) % 16;
+            } else if (step < 48) {
+                f = b ^ c ^ d;
+                g = (3 * step + 5) % 16;
+            } else {
+                f = c ^ (b | ~d);
+                g = (7 * step) % 16;
+            }
+            const std::uint32_t sum = a + f + kRoundConstants[step] + message[g];
+            a = d;
+            d = c;
+            c = b;
+            b = b + std::rotl(sum, static_cast<int>(kRotations[step]));
+        }
+
+        a += startA;
+        b += startB;
+        c += startC;
+        d += startD;
+    }
+
+    state[0] = a;
+    state[1] = b;
+    state[2] = c;
+    state[3] = d;
 }
 
 }  // namespace hashlib::detail

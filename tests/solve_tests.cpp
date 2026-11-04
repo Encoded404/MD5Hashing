@@ -181,6 +181,22 @@ TEST(SolveTest, PhraseComposesWords) {
     EXPECT_EQ(outcome.solution->candidate, "listen to me");
 }
 
+TEST(SolveTest, PhraseV1ComposesWords) {
+    const solve::Outcome outcome = SolveWithWordlist("listen\nsilent\nto\nme\n", "listen to me",
+                                                     "silent to me", "phrase-v1");
+    ASSERT_EQ(outcome.status, solve::Status::found);
+    ASSERT_TRUE(outcome.solution.has_value());
+    EXPECT_EQ(outcome.solution->candidate, "listen to me");
+    EXPECT_EQ(outcome.solution->solver, "phrase-v1");
+}
+
+TEST(SolveTest, PhraseV1CanReuseAWord) {
+    const solve::Outcome outcome =
+        SolveWithWordlist("me\n", "me me", "em em", "phrase-v1");
+    ASSERT_EQ(outcome.status, solve::Status::found);
+    EXPECT_EQ(outcome.solution->candidate, "me me");
+}
+
 TEST(SolveTest, PhraseHandlesTwoWords) {
     const solve::Outcome outcome =
         SolveWithWordlist("listen\nto\n", "listen to", "silent to", "phrase");
@@ -222,6 +238,20 @@ TEST(SolveTest, AutoChoosesPhraseForMultiWordAnagram) {
     const std::optional<solve::Plan> plan = solve::PlanSearch(problem, "auto", error);
     ASSERT_TRUE(plan.has_value()) << error;
     EXPECT_EQ(plan->solver, "phrase");
+}
+
+TEST(SolveTest, PlanAcceptsPhraseV1) {
+    const TempWordlist words{"listen\nsilent\nto\nme\n"};
+
+    solve::SearchProblem problem;
+    problem.target.digest = DigestOf("listen to me");
+    problem.anagram = solve::Anagram{"silent to me"};
+    problem.wordlist = solve::Wordlist{words.path()};
+
+    std::string error;
+    const std::optional<solve::Plan> plan = solve::PlanSearch(problem, "phrase-v1", error);
+    ASSERT_TRUE(plan.has_value()) << error;
+    EXPECT_EQ(plan->solver, "phrase-v1");
 }
 
 TEST(SolveTest, MultiWordAutoRequiresAWordlist) {
