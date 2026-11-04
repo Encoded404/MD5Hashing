@@ -19,7 +19,7 @@ inline constexpr std::size_t kMaxPhraseWords = solve::kMaxPhraseWords;
 /// Value of `index_of_` for a character outside the anagram.
 inline constexpr std::uint8_t kNoIndex = 0xFF;
 /// Prefix budget shared by both phrase searches.
-inline constexpr std::uint64_t kPhraseNodeBudget = 100'000'000;
+inline constexpr std::uint64_t kPhraseNodeBudget = 1'000'000'000;
 inline constexpr std::uint64_t kMaxU64 = std::numeric_limits<std::uint64_t>::max();
 /// Bytes of a word copied by the phrase writer's fixed-size move.
 /// The store may run past the phrase; SlotStride in phrase.cpp reserves the room.

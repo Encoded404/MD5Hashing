@@ -41,8 +41,11 @@ public:
             return;
         }
 
+        // create a string that contains the same amount of letters as the phrase
         std::string letters;
+        // reserve enough space for the letters
         letters.reserve(phrase.size());
+        // copy the phrase into letters, excluding spaces
         for (const char ch : phrase) {
             if (ch != ' ') {
                 letters.push_back(ch);
@@ -53,13 +56,16 @@ public:
             return;
         }
         total_letters_ = letters.size();
+        // for phrases with less than kMaxPhraseWords. we set the max words (depth) to the letter count.
         max_words_ = std::min<std::size_t>(total_letters_, kMaxPhraseWords);
         if (max_words_ < 2) {
             error_ = "a multi-word phrase needs at least two letters";
             return;
         }
 
+        // fill the index_of_ array with kNoIndex
         index_of_.fill(kNoIndex);
+        // fill the index_of_ array with the index of the chars
         for (const unsigned char ch : letters) {
             const std::size_t index = FindOrAddChar(ch);
             if (index == kMaxPhraseUnique) {
@@ -67,6 +73,7 @@ public:
                          std::to_string(kMaxPhraseUnique) + " distinct characters";
                 return;
             }
+            // count up the per character type counts.
             ++target_counts_[index];
         }
 
@@ -105,11 +112,13 @@ public:
             bool fits = true;
             for (const unsigned char ch : token) {
                 const std::size_t index = index_of_[ch];
+                // the letter is not in the target phrase
                 if (index == kNoIndex) {
                     fits = false;
                     break;
                 }
                 ++word.counts[index];
+                // the letter amount in the word exceeds the target phrase
                 if (word.counts[index] > target_counts_[index]) {
                     fits = false;
                     break;
@@ -227,7 +236,9 @@ private:
         candidate_budget,
     };
 
-    std::size_t FindOrAddChar(unsigned char ch) {
+    /// find the index of a char in the index_of_ array. and add it if it doesn't exist.
+    std::size_t FindOrAddChar(const unsigned char ch) {
+        // index found, return it.
         if (index_of_[ch] != kNoIndex) {
             return index_of_[ch];
         }
