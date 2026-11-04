@@ -1,8 +1,8 @@
 # Comments
 
-One thought per line. Never hard-wrap at 80 columns: break where a sentence or clause ends, even if the line runs long.
+One thought per line. A thought is usually a sentence; keep closely related clauses of the same sentence together, and do not split at every comma. Two short sentences may share a line when they make one point. Never hard-wrap at 80 columns: break at a sentence boundary, even if the line runs long.
 
-A colon that introduces a list ends the line. Each item gets its own line and its own period, and the joining "or"/"and" is dropped.
+A colon that introduces a list normally ends the line. Each item gets its own line and its own period, and the joining "or"/"and" is dropped. A short list that fits on one continuation line may stay there. A colon that introduces an explanation may continue on the next line.
 
 ```cpp
 // The solver picks a strategy:
